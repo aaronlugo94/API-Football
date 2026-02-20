@@ -2,26 +2,21 @@ import os
 import time
 import requests
 import schedule
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# --- CONFIGURACIÓN V2.0 (API-FOOTBALL ULTRA-LEAN) ---
+# --- CONFIGURACIÓN V2.2 (ULTRA-LEAN + BTTS + DNB) ---
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-API_SPORTS_KEY = os.getenv("API_SPORTS_KEY", "")  # <--- TU NUEVA API KEY
+API_SPORTS_KEY = os.getenv("API_SPORTS_KEY", "")
 
 RUN_TIME = "02:50" 
 
 # LIGAS TOP (IDs oficiales de API-FOOTBALL)
 TARGET_LEAGUES = {
-    39: '🇬🇧 PREMIER LEAGUE',
-    140: '🇪🇸 LA LIGA',
-    135: '🇮🇹 SERIE A',
-    78: '🇩🇪 BUNDESLIGA',
-    61: '🇫🇷 LIGUE 1',
-    2: '🏆 CHAMPIONS LEAGUE',
-    3: '🏆 EUROPA LEAGUE'
+    39: '🇬🇧 PREMIER LEAGUE', 140: '🇪🇸 LA LIGA', 135: '🇮🇹 SERIE A',
+    78: '🇩🇪 BUNDESLIGA', 61: '🇫🇷 LIGUE 1', 2: '🏆 CHAMPIONS LEAGUE', 3: '🏆 EUROPA LEAGUE'
 }
 
 # --- DIAGNÓSTICO GEMINI ---
@@ -34,9 +29,7 @@ except ImportError: pass
 
 class APIFootballBot:
     def __init__(self):
-        self.headers = {
-            'x-apisports-key': API_SPORTS_KEY
-        }
+        self.headers = {'x-apisports-key': API_SPORTS_KEY}
         self.full_reports_buffer = []
         
         self.ai_client = None
@@ -44,7 +37,7 @@ class APIFootballBot:
             try: self.ai_client = genai.Client(api_key=GEMINI_API_KEY)
             except: pass
             
-        self.send_msg("🚀 <b>INICIANDO BOT V2.0 (API-FOOTBALL)</b>\nModo Ultra-Lean Activado. Reglas Always Win estrictas.")
+        self.send_msg("🚀 <b>BOT V2.2 ACTUALIZADO (API-FOOTBALL)</b>\nModo Ultra-Lean. DNB y BTTS Activados. Reglas Always Win estrictas (-250).")
 
     def send_msg(self, text):
         if not TELEGRAM_TOKEN: return
@@ -66,9 +59,8 @@ class APIFootballBot:
             return r.text if r.text else "⚠️ Respuesta vacía."
         except Exception as e: return f"⚠️ Error Gemini: {e}"
 
-    # --- LLAMADAS A LA API (AHORRANDO CUOTA) ---
+    # --- LLAMADAS A LA API (1 Petición = Cientos de Datos) ---
     def get_fixtures_today(self, date_str):
-        # 1 sola petición para ver TODO el calendario del día
         url = f"https://v3.football.api-sports.io/fixtures?date={date_str}"
         try:
             res = requests.get(url, headers=self.headers, timeout=10).json()
@@ -76,12 +68,11 @@ class APIFootballBot:
         except: return []
 
     def get_odds(self, fixture_id):
-        # Bookmaker 8 = Bet365 (El estándar de oro)
+        # Bookmaker 8 = Bet365
         url = f"https://v3.football.api-sports.io/odds?fixture={fixture_id}&bookmaker=8"
         try:
             res = requests.get(url, headers=self.headers, timeout=10).json()
-            if res['results'] > 0:
-                return res['response'][0]['bookmakers'][0]['bets']
+            if res['results'] > 0: return res['response'][0]['bookmakers'][0]['bets']
             return []
         except: return []
 
@@ -89,35 +80,11 @@ class APIFootballBot:
         url = f"https://v3.football.api-sports.io/predictions?fixture={fixture_id}"
         try:
             res = requests.get(url, headers=self.headers, timeout=10).json()
-            if res['results'] > 0:
-                return res['response'][0]
+            if res['results'] > 0: return res['response'][0]
             return None
         except: return None
 
-    # --- MOTOR DE REGLAS "ALWAYS WIN" ---
-    def evaluate_pick(self, name, odd, prob):
-        # Reglas implacables de tu estrategia
-        if odd < 1.05: return None
-        
-        status = "VALID"
-        reason = "OK"
-        
-        # 2. Rango PARLAY: -250 a -130 (1.40 a 1.76 decimal)
-        if 1.40 <= odd < 1.60:
-            if prob < 0.65: status = "REJECTED"; reason = "Prob < 65% para Parlay"
-        
-        # 1. Rango SIMPLE: -165 a +110 (1.60 a 2.10 decimal)
-        elif 1.60 <= odd <= 2.10:
-            if prob < 0.55: status = "REJECTED"; reason = "Prob < 55% para Simple"
-        
-        # Límites Prohibidos
-        elif odd > 2.10: status = "REJECTED"; reason = "Cuota Alta (> +110)"
-        elif odd < 1.40: status = "REJECTED"; reason = "Cuota Basura (< -250)"
-
-        if status == "VALID":
-            return {'pick': name, 'odd': odd, 'prob': prob}
-        return None
-
+    # --- ESCÁNER PRINCIPAL ---
     def run_daily_scan(self):
         self.full_reports_buffer = []
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -126,140 +93,170 @@ class APIFootballBot:
             self.send_msg("⚠️ ERROR: Falta la API_SPORTS_KEY en las variables de entorno.")
             return
 
-        self.send_msg(f"🔎 <b>Escaneando API-FOOTBALL...</b>\nBuscando partidos para hoy: {today_str}")
+        self.send_msg(f"🔎 <b>Escaneando Mercados de Élite...</b>\nFecha: {today_str}")
         
-        # 1. Traer todos los partidos de hoy (1 Request)
+        # 1. Calendario del día
         all_fixtures = self.get_fixtures_today(today_str)
-        
-        # 2. Filtrar solo las ligas TOP
         top_matches = [f for f in all_fixtures if f['league']['id'] in TARGET_LEAGUES]
         
         if not top_matches:
             self.send_msg("🧹 Barrido completado. No hay partidos de las ligas principales hoy.")
             return
-            
-        self.send_msg(f"✅ Encontrados {len(top_matches)} partidos TOP. Extrayendo métricas de la API...")
 
-        # 3. Analizar los partidos interesantes
+        # 2. Análisis de Partidos Top
         for match in top_matches:
             fix_id = match['fixture']['id']
             home_team = match['teams']['home']['name']
             away_team = match['teams']['away']['name']
             league_name = TARGET_LEAGUES[match['league']['id']]
             
-            # Pausa de seguridad para no saturar la API (Rate Limit)
-            time.sleep(1) 
+            time.sleep(1) # Rate limit safety (Ahorra créditos y evita bloqueos)
             
-            # --- OBTENER CUOTAS (ODDS) ---
             bets = self.get_odds(fix_id)
-            if not bets: continue
-            
-            odds_data = {}
-            for bet in bets:
-                if bet['id'] == 1: # Match Winner
-                    for val in bet['values']: odds_data[val['value']] = float(val['odd'])
-            
-            # Si no hay cuota de local, saltar
-            if 'Home' not in odds_data: continue
-
-            # --- OBTENER PREDICCIONES (PROBABILIDADES REALES) ---
             preds = self.get_predictions(fix_id)
-            if not preds: continue
+            if not bets or not preds: continue
             
-            # Extraer porcentajes de la API (vienen como "45%")
+            # Extraer Probabilidades de la API (Machine Learning)
             try:
                 p_home = float(preds['predictions']['percent']['home'].replace('%', '')) / 100
                 p_draw = float(preds['predictions']['percent']['draw'].replace('%', '')) / 100
                 p_away = float(preds['predictions']['percent']['away'].replace('%', '')) / 100
             except: continue
-            
-            # Probabilidades calculadas
-            prob_1x = p_home + p_draw
-            prob_x2 = p_away + p_draw
-            
-            candidates = []
-            
-            # Evaluar Winner Directo
-            if 'Home' in odds_data:
-                c = self.evaluate_pick(f"Gana {home_team}", odds_data['Home'], p_home)
-                if c: candidates.append(c)
-            if 'Away' in odds_data:
-                c = self.evaluate_pick(f"Gana {away_team}", odds_data['Away'], p_away)
-                if c: candidates.append(c)
-                
-            # Calcular Double Chance (1X2) matemáticamente si la API no nos dio el momio directo
-            # En Bet365 la doble oportunidad suele rondar estas fórmulas aproximadas
-            odd_1x = 1 / ((1/odds_data.get('Home', 1)) + (1/odds_data.get('Draw', 1))) * 0.94 if 'Home' in odds_data and 'Draw' in odds_data else 0
-            odd_x2 = 1 / ((1/odds_data.get('Away', 1)) + (1/odds_data.get('Draw', 1))) * 0.94 if 'Away' in odds_data and 'Draw' in odds_data else 0
-            
-            c1x = self.evaluate_pick(f"{home_team} o Empate (1X)", odd_1x, prob_1x)
-            if c1x: candidates.append(c1x)
-            
-            cx2 = self.evaluate_pick(f"{away_team} o Empate (X2)", odd_x2, prob_x2)
-            if cx2: candidates.append(cx2)
 
-            # Tomar el mejor candidato (mayor probabilidad que cumpla las reglas)
-            if candidates:
-                candidates.sort(key=lambda x: x['prob'], reverse=True)
-                best = candidates[0]
+            advice = str(preds['predictions']['advice']).lower()
+            market_probs = {}
+            
+            # Variables para calcular DNB matemáticamente
+            odd_h = odd_a = odd_d = 0
+
+            # --- EXTRACCIÓN DE TODOS LOS MERCADOS DE BET365 ---
+            for bet in bets:
+                # 1. MATCH WINNER (ID 1)
+                if bet['id'] == 1: 
+                    for v in bet['values']:
+                        name = f"Gana {home_team}" if v['value'] == 'Home' else f"Gana {away_team}" if v['value'] == 'Away' else "Empate"
+                        base_p = p_home if v['value'] == 'Home' else p_away if v['value'] == 'Away' else p_draw
+                        implied = (1 / float(v['odd'])) * 0.95
+                        final_p = (base_p * 0.3) + (implied * 0.7) 
+                        market_probs[name] = {'odd': float(v['odd']), 'prob': final_p}
+                        
+                        if v['value'] == 'Home': odd_h = float(v['odd'])
+                        elif v['value'] == 'Away': odd_a = float(v['odd'])
+                        elif v['value'] == 'Draw': odd_d = float(v['odd'])
                 
-                fair_odd = self.dec_to_am(1/best['prob']) if best['prob'] > 0 else "-"
+                # 2. DOUBLE CHANCE (ID 12)
+                elif bet['id'] == 12: 
+                    for v in bet['values']:
+                        if v['value'] == 'Home/Draw': name = f"{home_team} o Empate (1X)"; base_p = p_home + p_draw
+                        elif v['value'] == 'Draw/Away': name = f"{away_team} o Empate (X2)"; base_p = p_away + p_draw
+                        else: continue
+                        implied = (1 / float(v['odd'])) * 0.95
+                        final_p = (base_p * 0.3) + (implied * 0.7)
+                        market_probs[name] = {'odd': float(v['odd']), 'prob': final_p}
                 
-                msg_ai = f"PARTIDO: {home_team} vs {away_team}\nLIGA: {league_name}\nSTATUS: VALID\nPICK: {best['pick']}\nPROB: {best['prob']:.2f}\nODD: {self.dec_to_am(best['odd'])}"
-                self.full_reports_buffer.append(msg_ai)
+                # 3. GOALS OVER/UNDER (ID 5)
+                elif bet['id'] == 5: 
+                    for v in bet['values']:
+                        if v['value'] in ['Over 1.5', 'Over 2.5', 'Under 2.5', 'Under 3.5']:
+                            implied = (1 / float(v['odd'])) * 0.94
+                            bonus = 0.05 if ("over" in advice and "Over" in v['value']) or ("under" in advice and "Under" in v['value']) else 0
+                            market_probs[f"{v['value']} Goles"] = {'odd': float(v['odd']), 'prob': implied + bonus}
+
+                # 4. AMBOS ANOTAN - BTTS (ID 8)
+                elif bet['id'] == 8:
+                    for v in bet['values']:
+                        name = f"Ambos Anotan (BTTS): SÍ" if v['value'] == 'Yes' else f"Ambos Anotan (BTTS): NO"
+                        implied = (1 / float(v['odd'])) * 0.94
+                        market_probs[name] = {'odd': float(v['odd']), 'prob': implied}
+
+            # 5. EMPATE NO ACCIÓN - DNB (Cálculo Seguro)
+            if odd_h > 0 and odd_a > 0 and odd_d > 0:
+                dnb_h_odd = odd_h * (1 - (1 / odd_d)) * 0.95
+                dnb_a_odd = odd_a * (1 - (1 / odd_d)) * 0.95
+                p_dnb_h = p_home / (p_home + p_away) if (p_home + p_away) > 0 else 0
+                p_dnb_a = p_away / (p_home + p_away) if (p_home + p_away) > 0 else 0
+                market_probs[f"{home_team} (Empate No Acción)"] = {'odd': dnb_h_odd, 'prob': p_dnb_h}
+                market_probs[f"{away_team} (Empate No Acción)"] = {'odd': dnb_a_odd, 'prob': p_dnb_a}
+
+            # --- FILTROS DE DINERO ESTRICTOS (ALWAYS WIN) ---
+            simples = []
+            parlays = []
+            
+            for pick_name, data in market_probs.items():
+                odd = data['odd']
+                prob = data['prob']
+                if odd < 1.05: continue
                 
-                log_msg = (
-                    f"🛡️ <b>ANÁLISIS V2.0 API</b> | {league_name}\n"
-                    f"⚽ <b>{home_team} vs {away_team}</b>\n"
-                    f"───────────────\n"
-                    f"🎯 PICK ENCONTRADO: <b>{best['pick']}</b>\n"
-                    f"⚖️ Cuota Avg: <b>{self.dec_to_am(best['odd'])}</b> ({best['odd']:.2f})\n"
-                    f"🧠 Probabilidad API: <b>{best['prob']*100:.1f}%</b> (Fair: {fair_odd})\n"
-                )
-                self.send_msg(log_msg)
+                # 🧱 Regla PARLAY (Rango 1.40 a 1.59 / Probabilidad >= 65%)
+                if 1.40 <= odd < 1.60 and prob >= 0.65:
+                    parlays.append({'pick': pick_name, 'odd': odd, 'prob': prob})
+                
+                # 💎 Regla SIMPLE (Rango 1.60 a 2.10 / Probabilidad >= 55%)
+                elif 1.60 <= odd <= 2.10 and prob >= 0.55:
+                    simples.append({'pick': pick_name, 'odd': odd, 'prob': prob})
+
+            # Tomar los de mayor probabilidad
+            simples.sort(key=lambda x: x['prob'], reverse=True)
+            parlays.sort(key=lambda x: x['prob'], reverse=True)
+            
+            best_simple = simples[0] if simples else None
+            best_parlay = parlays[0] if parlays else None
+            
+            if not best_simple and not best_parlay: continue
+
+            # Preparamos textos para el reporte de Gemini
+            picks_text = ""
+            if best_simple:
+                picks_text += f"\n💎 SIMPLE: {best_simple['pick']} | CUOTA: {self.dec_to_am(best_simple['odd'])} | PROB: {best_simple['prob']*100:.1f}%"
+            if best_parlay:
+                picks_text += f"\n🧱 PARLAY: {best_parlay['pick']} | CUOTA: {self.dec_to_am(best_parlay['odd'])} | PROB: {best_parlay['prob']*100:.1f}%"
+
+            msg_ai = f"PARTIDO: {home_team} vs {away_team}\nLIGA: {league_name}{picks_text}"
+            self.full_reports_buffer.append(msg_ai)
 
         if self.full_reports_buffer:
             self.generate_vip_summary()
         else:
-            self.send_msg("🧹 Análisis de la API finalizado. Ningún pick superó los filtros 'Always Win' (Rango -250 a +110).")
+            self.send_msg("🧹 Análisis finalizado. Ningún pick superó los filtros estrictos de valor y seguridad (-250) para el día de hoy.")
 
     def generate_vip_summary(self):
-        self.send_msg("⏳ <b>Generando Reporte VIP Oficial...</b>")
+        self.send_msg("⏳ <b>Armando Reporte VIP Dual...</b>")
         reports_text = "\n\n".join(self.full_reports_buffer)
         
         prompt = f"""
-        Actúa como un Gestor de Inversiones Deportivas. Tienes los picks filtrados directamente desde API-FOOTBALL.
-        Tu misión es generar el reporte VIP copiando EXACTAMENTE los datos sin inventar matemáticas.
+        Actúa como un Tipster Profesional y Gestor de Inversiones. Tienes los picks filtrados por la API.
         
-        🚨 REGLAS ESTRICTAS:
-        1. COPIA la cuota (ODD) que viene en el texto.
-        2. NO generes picks que no vengan en el texto.
+        REGLAS ESTRICTAS:
+        1. COPIA los datos exactos del texto provisto (Las cuotas americanas y probabilidades). NUNCA inventes números.
+        2. REDACTA una oración breve y atractiva analizando el partido (Ej: "El local busca consolidarse en la cima en un duelo cerrado").
+        3. Para cada partido, muestra los picks que te paso (ya sea 💎 Simple, 🧱 Parlay, o ambos).
         
         --- FORMATO VISUAL OBLIGATORIO ---
-        🏆 <b>ANÁLISIS VIP V2.0 (API POWERED)</b>
-        <i>Algoritmos de precisión procesando valor real.</i>
+        🏆 <b>ANÁLISIS VIP V2.2 (API POWERED)</b>
+        <i>Algoritmos de élite detectando Valor y Seguridad.</i>
         ───────────────────
 
         (Repite para cada partido recibido):
         ⚽ <b>[Local] vs [Visita]</b>
-        <i>[Narrativa corta]</i>
-        💎 <code>[PICK]</code> @ <b>[Odd Copiada]</b> ([Prob]%)
+        <i>[Aquí redacta tu línea de análisis real]</i>
+        (Pon aquí la línea de 💎 SIMPLE si el texto la trae, con su Pick, Cuota Americana y Prob)
+        (Pon aquí la línea de 🧱 PARLAY si el texto la trae, con su Pick, Cuota Americana y Prob)
         ───────────────────
 
         🎫 <b>TICKET MAESTRO DEL DÍA</b>
-        1️⃣ [Mejor Pick 1]
-        2️⃣ [Mejor Pick 2]
+        (REGLA DE ORO: Arma este ticket 1️⃣ y 2️⃣ SOLAMENTE usando picks que tengan el icono 🧱 PARLAY. Combina un par de ellos. Si el texto no te dio NINGÚN pick 🧱 PARLAY, entonces escribe: "Hoy el valor está en las cuotas simples. No hay piezas de alta seguridad para armar Parlay.")
         
+        DATOS A PROCESAR:
         {reports_text}
         """
         self.send_msg(self.call_gemini(prompt))
 
 if __name__ == "__main__":
     bot = APIFootballBot()
-    # Para probarlo INMEDIATAMENTE al hacer el deploy:
+    # Ejecuta un escaneo al arrancar
     bot.run_daily_scan() 
     
-    # Loop de horario
+    # Loop de horario configurado
     schedule.every().day.at(RUN_TIME).do(bot.run_daily_scan)
     while True: 
         schedule.run_pending()
