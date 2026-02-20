@@ -5,183 +5,220 @@ import schedule
 import sqlite3
 import numpy as np
 from datetime import datetime, timedelta, timezone
-from math import exp, lgamma
+from math import exp, lgamma, log
 
 # ==========================================
-# CONFIGURACIÓN V5.3 (QUANT SYNDICATE EDITION)
+# V5.6 QUANT FUND CONFIGURATION
 # ==========================================
+
+# --- SYSTEM FLAGS ---
+LIVE_TRADING = False  # Set to True ONLY after 72h burn-in
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 API_SPORTS_KEY = os.getenv("API_SPORTS_KEY", "")
 
 DB_DIR = os.getenv("DB_DIR", "./data")
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "quant_v5.db")
 
-RUN_TIME = "01:50" 
+RUN_TIME_SCAN = "02:50"
+RUN_TIME_INGEST = "04:00"
 
+# --- LEAGUES & LIQUIDITY ---
 TARGET_LEAGUES = {
     39: '🇬🇧 PREMIER', 140: '🇪🇸 LA LIGA', 135: '🇮🇹 SERIE A',
     78: '🇩🇪 BUNDESLIGA', 61: '🇫🇷 LIGUE 1', 2: '🏆 CHAMPIONS', 3: '🏆 EUROPA',
     71: '🇳🇱 EREDIVISIE', 94: '🇵🇹 PRIMEIRA', 40: '🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP'
 }
 
-LEAGUE_GOAL_FACTOR = {
-    '🇩🇪 BUNDESLIGA': 1.12, '🇳🇱 EREDIVISIE': 1.15, '🇫🇷 LIGUE 1': 0.95,
-    '🇮🇹 SERIE A': 0.92, '🇪🇸 LA LIGA': 0.94, '🇬🇧 PREMIER': 1.00,
-    '🇵🇹 PRIMEIRA': 0.96, '🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP': 1.05, '🏆 CHAMPIONS': 0.98, '🏆 EUROPA': 1.00
+LIQUIDITY_TIERS = {
+    '🇬🇧 PREMIER': 1.00, '🏆 CHAMPIONS': 1.00, '🇪🇸 LA LIGA': 1.00, '🇮🇹 SERIE A': 1.00, '🇩🇪 BUNDESLIGA': 1.00,
+    '🏆 EUROPA': 0.85, '🇫🇷 LIGUE 1': 0.85, '🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP': 0.85,
+    '🇳🇱 EREDIVISIE': 0.75, '🇵🇹 PRIMEIRA': 0.75
 }
 
+LEAGUE_UPDATE_SCHEDULE = {
+    0: 39, 1: 140, 2: 135, 3: 78, 4: 61, 5: 71, 6: 40
+}
+
+# --- RISK PARAMETERS ---
 KELLY_MULTIPLIER_BY_MARKET = {
-    "GOALS": 0.25, "DC": 0.50, "1X2": 0.20
+    "UNDER": 0.30,   # Varianza acotada
+    "OVER":  0.20,   # Varianza abierta (NegBin fat tails)
+    "DC":    0.50,   # Varianza mínima
+    "1X2":   0.20    # Alta varianza
 }
-
 CLV_KILL_SWITCH_THRESHOLD = -0.015
-
-SDK_AVAILABLE = False
-try:
-    from google import genai
-    from google.genai import types
-    SDK_AVAILABLE = True
-except ImportError: pass
+BASELINE_GOALS = 2.6
 
 # ==========================================
-# UTILIDADES MATEMÁTICAS
-# ==========================================
-
-def poisson_prob(lam, k):
-    if lam <= 0: return 0.0
-    return exp(k * np.log(lam) - lam - lgamma(k + 1))
-
-def calc_over_under_prob(xg_total, line):
-    cutoff = int(np.floor(line))
-    p_under = sum(poisson_prob(xg_total, k) for k in range(cutoff + 1))
-    return 1 - p_under, p_under
-
-def clamp(x, low, high): return max(low, min(x, high))
-
-# ==========================================
-# BASE DE DATOS
+# DATABASE & SCHEMA EVOLUTION
 # ==========================================
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS picks_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        fixture_id INTEGER, league TEXT, home_team TEXT, away_team TEXT,
-        market TEXT, selection TEXT, selection_key TEXT,
-        odd_open REAL, prob_model REAL, ev_open REAL, stake_pct REAL,
-        xg_home REAL, xg_away REAL, xg_total REAL,
-        pick_time DATETIME, kickoff_time DATETIME,
+        id INTEGER PRIMARY KEY AUTOINCREMENT, fixture_id INTEGER, league TEXT, home_team TEXT, away_team TEXT,
+        market TEXT, selection TEXT, selection_key TEXT, odd_open REAL, prob_model REAL, ev_open REAL, 
+        stake_pct REAL, xg_home REAL, xg_away REAL, xg_total REAL, pick_time DATETIME, kickoff_time DATETIME, 
         clv_captured INTEGER DEFAULT 0
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS closing_lines (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        fixture_id INTEGER, market TEXT, selection_key TEXT,
+        id INTEGER PRIMARY KEY AUTOINCREMENT, fixture_id INTEGER, market TEXT, selection_key TEXT,
         odd_close REAL, implied_prob_close REAL, capture_time DATETIME
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS league_advanced_factors (
+        league TEXT PRIMARY KEY, shots_avg REAL, shots_on_target_avg REAL, goals_per_shot REAL, 
+        goals_per_sot REAL, goal_std REAL, matches INTEGER, window_days INTEGER, last_updated DATETIME
+    )""")
+    
+    # V5.6 Migration: Split 'GOALS' into 'OVER' / 'UNDER'
+    c.execute("UPDATE picks_log SET market = 'OVER' WHERE market = 'GOALS' AND selection LIKE '%Over%'")
+    c.execute("UPDATE picks_log SET market = 'UNDER' WHERE market = 'GOALS' AND selection LIKE '%Under%'")
+    c.execute("UPDATE closing_lines SET market = 'OVER' WHERE market = 'GOALS' AND selection_key LIKE '%Over%'")
+    c.execute("UPDATE closing_lines SET market = 'UNDER' WHERE market = 'GOALS' AND selection_key LIKE '%Under%'")
+    
     conn.commit()
     conn.close()
 
+# ==========================================
+# TELEMETRY & METRICS
+# ==========================================
+
 def get_avg_clv_by_market(market, lookback=30):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("""
-            SELECT AVG((p.odd_open - c.odd_close) / p.odd_open)
-            FROM picks_log p
-            JOIN closing_lines c ON p.fixture_id = c.fixture_id 
-                AND p.market = c.market AND p.selection_key = c.selection_key
-            WHERE p.market = ? AND p.clv_captured = 1
-            ORDER BY p.id DESC LIMIT ?
-        """, (market, lookback))
-        res = c.fetchone()[0]
-        conn.close()
-        return float(res) if res is not None else 0.0
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        c.execute("SELECT AVG((p.odd_open - c.odd_close)/p.odd_open) FROM picks_log p JOIN closing_lines c ON p.fixture_id=c.fixture_id AND p.market=c.market AND p.selection_key=c.selection_key WHERE p.market=? AND p.clv_captured=1 ORDER BY p.id DESC LIMIT ?", (market, lookback))
+        res = c.fetchone()[0]; conn.close()
+        return float(res) if res else 0.0
     except: return 0.0
 
 def get_global_volatility(lookback=30):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("""
-            SELECT (p.odd_open - c.odd_close) / p.odd_open
-            FROM picks_log p
-            JOIN closing_lines c ON p.fixture_id = c.fixture_id 
-                AND p.market = c.market AND p.selection_key = c.selection_key
-            WHERE p.clv_captured = 1
-            ORDER BY p.id DESC LIMIT ?
-        """, (lookback,))
-        clvs = [row[0] for row in c.fetchall()]
-        conn.close()
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        c.execute("SELECT (p.odd_open - c.odd_close)/p.odd_open FROM picks_log p JOIN closing_lines c ON p.fixture_id=c.fixture_id AND p.clv_captured=1 ORDER BY p.id DESC LIMIT ?", (lookback,))
+        clvs = [row[0] for row in c.fetchall()]; conn.close()
         return np.std(clvs) if len(clvs) >= 10 else 0.0
     except: return 0.0
 
+def get_league_factors(league_name):
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute("SELECT shots_avg, goal_std FROM league_advanced_factors WHERE league = ?", (league_name,))
+    row = c.fetchone(); conn.close()
+    if row: return {"pace": clamp(row[0]/24.0, 0.85, 1.20), "std": row[1]}
+    return {"pace": 1.0, "std": None}
+
 # ==========================================
-# MÓDULO xG SINTÉTICO
+# MATH & PRICING ENGINE (NEGBIN LITE)
 # ==========================================
 
-def synthetic_xg_model(preds, h_inj, a_inj, league_name):
+def clamp(x, low, high): return max(low, min(x, high))
+
+def negbin_prob(mu, var, k):
+    if mu <= 0: return 0.0
+    if var <= mu * 1.01: return exp(k * log(mu) - mu - lgamma(k + 1)) # Poisson Fallback
+    r = (mu ** 2) / (var - mu)
+    if r <= 0: return exp(k * log(mu) - mu - lgamma(k + 1))
+    p = r / (r + mu)
+    log_pmf = lgamma(k + r) - lgamma(r) - lgamma(k + 1) + r * log(p) + k * log(1 - p)
+    return exp(log_pmf)
+
+def calc_over_under_prob_adj(xg_total, line, league_std):
+    var = max(league_std ** 2, xg_total) if league_std else xg_total
+    cutoff = int(np.floor(line))
+    p_under = sum(negbin_prob(xg_total, var, k) for k in range(cutoff + 1))
+    return 1 - p_under, p_under
+
+def synthetic_xg_model(preds, h_inj, a_inj, league_pace):
     try:
-        g_h_for = float(preds['teams']['home']['goals']['for']['average']['home'])
-        g_h_aga = float(preds['teams']['home']['goals']['against']['average']['home'])
-        g_a_for = float(preds['teams']['away']['goals']['for']['average']['away'])
-        g_a_aga = float(preds['teams']['away']['goals']['against']['average']['away'])
-    except:
-        g_h_for = g_h_aga = g_a_for = g_a_aga = 1.0
-
-    xg_home = (g_h_for + g_a_aga) / 2
-    xg_away = (g_a_for + g_h_aga) / 2
-
-    form_h_pts = preds['teams']['home'].get('form', '').count('W') * 3 + preds['teams']['home'].get('form', '').count('D')
-    form_a_pts = preds['teams']['away'].get('form', '').count('W') * 3 + preds['teams']['away'].get('form', '').count('D')
-
-    xg_home *= clamp(form_h_pts / 15, 0.7, 1.2) * (1 - min(h_inj * 0.015, 0.08))
-    xg_away *= clamp(form_a_pts / 15, 0.7, 1.2) * (1 - min(a_inj * 0.015, 0.08))
-
-    lf = LEAGUE_GOAL_FACTOR.get(league_name, 1.0)
-    xg_home, xg_away = clamp(xg_home * lf, 0.3, 3.5), clamp(xg_away * lf, 0.3, 3.5)
-    return xg_home, xg_away, xg_home + xg_away
+        ghf, gha = float(preds['teams']['home']['goals']['for']['average']['home']), float(preds['teams']['home']['goals']['against']['average']['home'])
+        gaf, gaa = float(preds['teams']['away']['goals']['for']['average']['away']), float(preds['teams']['away']['goals']['against']['average']['away'])
+    except: ghf = gha = gaf = gaa = 1.2
+    
+    xh, xa = (ghf + gaa)/2, (gaf + gha)/2
+    fh = preds['teams']['home'].get('form', 'DDDDD').count('W')*3 + preds['teams']['home'].get('form', 'DDDDD').count('D')
+    fa = preds['teams']['away'].get('form', 'DDDDD').count('W')*3 + preds['teams']['away'].get('form', 'DDDDD').count('D')
+    
+    xh *= clamp(fh/15, 0.7, 1.2) * (1 - min(h_inj*0.015, 0.08)) * league_pace
+    xa *= clamp(fa/15, 0.7, 1.2) * (1 - min(a_inj*0.015, 0.08)) * league_pace
+    return clamp(xh, 0.3, 3.5), clamp(xa, 0.3, 3.5), xh + xa
 
 # ==========================================
-# CLASE PRINCIPAL
+# CORE: RISK MANAGEMENT V5.6
 # ==========================================
 
-class APIFootballQuantBot:
+def calculate_final_stake(ev, odds, market, league_name):
+    avg_clv = get_avg_clv_by_market(market)
+    if avg_clv < CLV_KILL_SWITCH_THRESHOLD: return 0.0 # Shadow Mode
+    
+    base_kelly = ev / (odds - 1)
+    market_mult = KELLY_MULTIPLIER_BY_MARKET.get(market, 0.20)
+    vol = get_global_volatility()
+    vol_penalty = clamp(1 - (vol * 2.5), 0.4, 1.0)
+    liq_mult = LIQUIDITY_TIERS.get(league_name, 0.60)
+    
+    final_kelly = base_kelly * market_mult * vol_penalty * liq_mult
+    return clamp(final_kelly, 0.0, 0.05)
+
+# ==========================================
+# ASYNC JOBS & SCANNERS
+# ==========================================
+
+class QuantFundNode:
     def __init__(self):
         init_db()
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
-        self.ai_client = None
-        if SDK_AVAILABLE and GEMINI_API_KEY:
-            try: self.ai_client = genai.Client(api_key=GEMINI_API_KEY)
-            except: pass
-        self.send_msg("🛡️ <b>V5.3 SYNDICATE-PROOF</b>\nArquitectura completa restaurada y corregida.")
+        mode = "🔴 LIVE TRADING" if LIVE_TRADING else "🟡 DRY-RUN MODE (72h Burn-in)"
+        self.send_msg(f"🛡️ <b>QUANT FUND V5.6 DEPLOYED</b>\nEstado: {mode}\nNegBin, Asymmetric Kelly & Liquidity Tiers activos.")
 
     def send_msg(self, text):
         if not TELEGRAM_TOKEN: return
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        try: requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
+        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
         except: pass
 
-    def adaptive_kelly(self, ev, odds, market):
-        avg_clv = get_avg_clv_by_market(market)
-        if avg_clv < CLV_KILL_SWITCH_THRESHOLD: return ev, 0.0
-        vol = get_global_volatility()
-        vol_penalty = clamp(1 - (vol * 2.5), 0.4, 1.0)
-        base_kelly = ev / (odds - 1)
-        m_mult = KELLY_MULTIPLIER_BY_MARKET.get(market, 0.25)
-        return ev, clamp(base_kelly * m_mult * vol_penalty, 0.0, 0.05)
+    def update_league_advanced_factors(self):
+        today = datetime.now(timezone.utc)
+        weekday = today.weekday()
+        if weekday not in LEAGUE_UPDATE_SCHEDULE: return
+        
+        league_id = LEAGUE_UPDATE_SCHEDULE[weekday]
+        league_name = TARGET_LEAGUES.get(league_id)
+        if not league_name: return
+        
+        season = today.year if today.month >= 8 else today.year - 1
+        teams = requests.get(f"https://v3.football.api-sports.io/teams?league={league_id}&season={season}", headers=self.headers, timeout=15).json().get("response", [])
+        
+        t_shots = t_sot = t_goals = 0; match_counts = []
+        for t in teams:
+            time.sleep(1.1)
+            stats = requests.get(f"https://v3.football.api-sports.io/teams/statistics?league={league_id}&season={season}&team={t['team']['id']}", headers=self.headers, timeout=15).json().get("response")
+            if not stats: continue
+            sh, sot, gls, m = stats['shots'].get('total', 0), stats['shots'].get('on', 0), stats['goals']['for']['total'].get('total', 0), stats['fixtures']['played'].get('total', 0)
+            if not sh or not gls or m == 0: continue
+            t_shots += sh; t_sot += (sot or 0); t_goals += gls; match_counts.append(m)
+            
+        if not match_counts: return
+        
+        m_total = sum(match_counts) / 2
+        sh_avg, sot_avg = t_shots / m_total, t_sot / m_total
+        gps, gsot = t_goals / t_shots, t_goals / max(t_sot, 1)
+        std_proxy = np.sqrt(gps * sh_avg)
+        
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        c.execute("""INSERT INTO league_advanced_factors (league, shots_avg, shots_on_target_avg, goals_per_shot, goals_per_sot, goal_std, matches, window_days, last_updated) 
+                     VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(league) DO UPDATE SET shots_avg=excluded.shots_avg, shots_on_target_avg=excluded.shots_on_target_avg, 
+                     goals_per_shot=excluded.goals_per_shot, goals_per_sot=excluded.goals_per_sot, goal_std=excluded.goal_std, last_updated=excluded.last_updated""", 
+                  (league_name, round(sh_avg, 2), round(sot_avg, 2), round(gps, 4), round(gsot, 4), round(std_proxy, 3), int(m_total), 30, today.isoformat()))
+        conn.commit(); conn.close()
 
     def capture_closing_lines(self):
         try:
             conn = sqlite3.connect(DB_PATH); c = conn.cursor()
             now = datetime.now(timezone.utc)
             c.execute("SELECT id, fixture_id, market, selection_key, kickoff_time FROM picks_log WHERE clv_captured = 0")
-            for row in c.fetchall():
-                pid, fid, mkt, skey, ko = row
+            for pid, fid, mkt, skey, ko in c.fetchall():
                 if (datetime.fromisoformat(ko) - now).total_seconds() / 60.0 <= 60.0:
                     res = requests.get(f"https://v3.football.api-sports.io/odds?fixture={fid}&bookmaker=8", headers=self.headers).json()
                     found = False
@@ -197,82 +234,82 @@ class APIFootballQuantBot:
         except: pass
 
     def run_daily_scan(self):
-        self.full_reports_buffer = []
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        
-        all_fixtures = []
-        for d in [today_str, tomorrow_str]:
+        reports = []
+        today, tomorrow = datetime.now().strftime("%Y-%m-%d"), (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        matches = []
+        for d in [today, tomorrow]:
             res = requests.get(f"https://v3.football.api-sports.io/fixtures?date={d}", headers=self.headers).json()
-            all_fixtures.extend(res.get('response', []))
+            matches.extend([f for f in res.get('response', []) if f['league']['id'] in TARGET_LEAGUES])
         
-        top_matches = [f for f in all_fixtures if f['league']['id'] in TARGET_LEAGUES][:12]
-
-        for match in top_matches:
-            fid = match['fixture']['id']
-            h_team = match['teams']['home']
-            a_team = match['teams']['away']
-            league_n = TARGET_LEAGUES[match['league']['id']]
-            ko_time = match['fixture']['date']
+        for m in matches[:15]:
+            fid, h_n, a_n = m['fixture']['id'], m['teams']['home']['name'], m['teams']['away']['name']
+            l_name, ko = TARGET_LEAGUES[m['league']['id']], m['fixture']['date']
             
             time.sleep(6.1)
-            bets = requests.get(f"https://v3.football.api-sports.io/odds?fixture={fid}&bookmaker=8", headers=self.headers).json().get('response', [])
+            odds_res = requests.get(f"https://v3.football.api-sports.io/odds?fixture={fid}&bookmaker=8", headers=self.headers).json().get('response', [])
             preds_res = requests.get(f"https://v3.football.api-sports.io/predictions?fixture={fid}", headers=self.headers).json().get('response', [])
             inj_res = requests.get(f"https://v3.football.api-sports.io/injuries?fixture={fid}", headers=self.headers).json().get('response', [])
 
-            if not bets or not preds_res: continue
-            
-            bets = bets[0]['bookmakers'][0]['bets']
-            preds = preds_res[0]
-            h_inj = sum(1 for i in inj_res if i['team']['id'] == h_team['id'])
-            a_inj = sum(1 for i in inj_res if i['team']['id'] == a_team['id'])
+            if not odds_res or not preds_res: continue
+            bets, preds = odds_res[0]['bookmakers'][0]['bets'], preds_res[0]
+            hinj = sum(1 for i in inj_res if i['team']['id'] == m['teams']['home']['id'])
+            ainj = sum(1 for i in inj_res if i['team']['id'] == m['teams']['away']['id'])
 
-            xh, xa, xt = synthetic_xg_model(preds, h_inj, a_inj, league_n)
+            factors = get_league_factors(l_name)
+            xh, xa, xt = synthetic_xg_model(preds, hinj, ainj, factors['pace'])
             
-            # --- Lógica de Mercados ---
-            market_probs = []
-            conf_api = 0.45 if league_n in ['🏆 CHAMPIONS', '🇬🇧 PREMIER'] else 0.35
-            conf_mkt = 1.0 - conf_api
+            c_api = 0.45 if l_name in ['🏆 CHAMPIONS', '🇬🇧 PREMIER'] else 0.35
+            c_mkt = 1.0 - c_api
+            m_probs = []
 
             for b in bets:
-                if b['id'] == 1: # 1X2
+                if b['id'] == 1:
                     for v in b['values']:
-                        name = f"Gana {h_team['name']}" if v['value'] == 'Home' else f"Gana {a_team['name']}" if v['value'] == 'Away' else "Empate"
+                        name = f"Gana {h_n}" if v['value'] == 'Home' else f"Gana {a_n}" if v['value'] == 'Away' else "Empate"
                         p_api = float(preds['predictions']['percent'][v['value'].lower()].replace('%',''))/100
-                        final_p = (p_api * conf_api) + ((1/float(v['odd'])/1.05) * conf_mkt)
-                        market_probs.append({"market": "1X2", "pick": name, "odd": float(v['odd']), "prob": final_p, "bid": b['id']})
-                elif b['id'] == 5: # Goals
+                        fp = (p_api * c_api) + ((1/float(v['odd'])/1.05) * c_mkt)
+                        m_probs.append({"mkt": "1X2", "pick": name, "odd": float(v['odd']), "prob": fp, "bid": b['id']})
+                elif b['id'] == 5:
                     for v in b['values']:
                         if v['value'] in ['Over 2.5', 'Under 2.5']:
-                            p_over, p_under = calc_over_under_prob(xt, 2.5)
-                            p_model = p_over if 'Over' in v['value'] else p_under
-                            final_p = (p_model * 0.6) + ((1/float(v['odd'])/1.07) * 0.4)
-                            market_probs.append({"market": "GOALS", "pick": f"{v['value']} Goles", "odd": float(v['odd']), "prob": final_p, "bid": b['id']})
+                            po, pu = calc_over_under_prob_adj(xt, 2.5, factors['std'])
+                            mkt_type = "OVER" if 'Over' in v['value'] else "UNDER"
+                            p_mod = po if mkt_type == "OVER" else pu
+                            fp = (p_mod * 0.6) + ((1/float(v['odd'])/1.07) * 0.4)
+                            m_probs.append({"mkt": mkt_type, "pick": f"{v['value']} Goles", "odd": float(v['odd']), "prob": fp, "bid": b['id']})
 
-            for item in market_probs:
-                ev, stake = self.adaptive_kelly(item['prob'], item['odd'], item['market'])
-                if ev < 0.02: continue
+            best_pick = None; max_ev = -1.0
+            for item in m_probs:
+                ev = (item['prob'] * item['odd']) - 1
+                if ev > max_ev: max_ev, best_pick = ev, item
+
+            if best_pick and max_ev >= 0.05:
+                calc_stake = calculate_final_stake(max_ev, best_pick['odd'], best_pick['mkt'], l_name)
+                op_stake = calc_stake if LIVE_TRADING else 0.0 # DRY RUN OVERRIDE
                 
-                s_key = f"{item['bid']}|{round(item['odd'], 2)}"
-                
-                # --- INSERT SEGURO ---
+                skey = f"{best_pick['bid']}|{round(best_pick['odd'],2)}"
                 conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-                c.execute("""INSERT INTO picks_log 
-                    (fixture_id, league, home_team, away_team, market, selection, selection_key, odd_open, prob_model, ev_open, stake_pct, xg_home, xg_away, xg_total, pick_time, kickoff_time) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (fid, league_n, h_team['name'], a_team['name'], item['market'], item['pick'], s_key, item['odd'], item['prob'], ev, stake, xh, xa, xt, datetime.now(timezone.utc).isoformat(), ko_time))
+                c.execute("""INSERT INTO picks_log (fixture_id, league, home_team, away_team, market, selection, selection_key, odd_open, prob_model, ev_open, stake_pct, xg_home, xg_away, xg_total, pick_time, kickoff_time) 
+                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (fid, l_name, h_n, a_n, best_pick['mkt'], best_pick['pick'], skey, best_pick['odd'], best_pick['prob'], max_ev, op_stake, xh, xa, xt, datetime.now(timezone.utc).isoformat(), ko))
                 conn.commit(); conn.close()
 
-                status = "💎" if stake > 0 else "⚠️ [SHADOW]"
-                self.full_reports_buffer.append(f"⚽ {h_team['name']} vs {a_team['name']}\n{status} {item['pick']} | @{item['odd']} | Stake: {stake*100:.1f}%")
+                # Visual Output
+                prefix = "🟡 [DRY-RUN]" if not LIVE_TRADING else ("💎" if op_stake > 0 else "⚠️ [SHADOW]")
+                disp_stake = calc_stake if not LIVE_TRADING else op_stake
+                reports.append(f"⚽ {h_n} vs {a_n}\n{prefix} {best_pick['pick']} | @{best_pick['odd']} | EV: +{max_ev*100:.1f}%\nTarget Stake: {disp_stake*100:.2f}%")
 
-        if self.full_reports_buffer: self.send_msg("\n\n".join(self.full_reports_buffer))
+        if reports: self.send_msg("\n\n".join(reports))
 
 if __name__ == "__main__":
-    bot = APIFootballQuantBot()
-    schedule.every().day.at(RUN_TIME).do(bot.run_daily_scan)
+    bot = QuantFundNode()
+    schedule.every().day.at(RUN_TIME_SCAN).do(bot.run_daily_scan)
+    schedule.every().day.at(RUN_TIME_INGEST).do(bot.update_league_advanced_factors)
     schedule.every(30).minutes.do(bot.capture_closing_lines)
+    
+    # Run tests on boot
+    bot.update_league_advanced_factors()
     bot.run_daily_scan()
+    
     while True:
         schedule.run_pending()
         time.sleep(60)
