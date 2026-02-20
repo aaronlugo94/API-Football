@@ -20,7 +20,7 @@ DB_DIR = os.getenv("DB_DIR", "./data")
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "quant_v5.db")
 
-RUN_TIME = "06:30" 
+RUN_TIME = "06:42" 
 
 TARGET_LEAGUES = {
     39: '🇬🇧 PREMIER', 140: '🇪🇸 LA LIGA', 135: '🇮🇹 SERIE A',
@@ -214,8 +214,11 @@ class APIFootballQuantBot:
             ev, stake = self.adaptive_kelly(fake_pick['ev'], fake_pick['odd'], fake_pick['market'])
             
             # LOGGING V5.3
-            conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-            c.execute("INSERT INTO picks_log (...) VALUES (...)", (...)) # Ver estructura de init_db
+conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+            c.execute("""INSERT INTO picks_log 
+                (fixture_id, league, home_team, away_team, market, selection, selection_key, odd_open, prob_model, ev_open, stake_pct, xg_home, xg_away, xg_total, pick_time, kickoff_time) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (fid, l_name, h_name, a_name, pick_market, pick_selection, skey, pick_odd, pick_prob, ev, stake, 1.5, 1.2, 2.7, datetime.now(timezone.utc).isoformat(), ko_time))
             conn.commit(); conn.close()
 
             status_prefix = "💎" if stake > 0 else "⚠️ [SHADOW MODE]"
