@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from math import exp, lgamma, log
 
 # ==========================================
-# V5.6 QUANT FUND CONFIGURATION
+# V5.6.1 QUANT FUND CONFIGURATION
 # ==========================================
 
 # --- SYSTEM FLAGS ---
@@ -38,7 +38,7 @@ LIQUIDITY_TIERS = {
     '🇳🇱 EREDIVISIE': 0.75, '🇵🇹 PRIMEIRA': 0.75
 }
 
-# 10 Ligas repartidas en 7 días para no exceder cuota de API
+# 10 Ligas repartidas en 7 días para no exceder cuota de API (100 req/day)
 LEAGUE_UPDATE_SCHEDULE = {
     0: [39, 94],  # Lunes: Premier League + Primeira Liga
     1: [140, 71], # Martes: La Liga + Eredivisie
@@ -160,21 +160,38 @@ def calc_over_under_prob_adj(xg_total, line, league_std):
     return 1 - p_under, p_under
 
 def synthetic_xg_model(preds, h_inj, a_inj, league_pace):
+    xh, xa = 1.4, 1.4 # Valores base seguros
+    
     try:
-        ghf, gha = float(preds['teams']['home']['goals']['for']['average']['home']), float(preds['teams']['home']['goals']['against']['average']['home'])
-        gaf, gaa = float(preds['teams']['away']['goals']['for']['average']['away']), float(preds['teams']['away']['goals']['against']['average']['away'])
-    except: ghf = gha = gaf = gaa = 1.2
+        ghf = float(preds['teams']['home']['league']['goals']['for']['average']['home'])
+        gaa = float(preds['teams']['away']['league']['goals']['against']['average']['away'])
+        xh = (ghf + gaa) / 2
+    except: pass
     
-    xh, xa = (ghf + gaa)/2, (gaf + gha)/2
-    fh = preds['teams']['home'].get('form', 'DDDDD').count('W')*3 + preds['teams']['home'].get('form', 'DDDDD').count('D')
-    fa = preds['teams']['away'].get('form', 'DDDDD').count('W')*3 + preds['teams']['away'].get('form', 'DDDDD').count('D')
+    try:
+        gaf = float(preds['teams']['away']['league']['goals']['for']['average']['away'])
+        gha = float(preds['teams']['home']['league']['goals']['against']['average']['home'])
+        xa = (gaf + gha) / 2
+    except: pass
     
-    xh *= clamp(fh/15, 0.7, 1.2) * (1 - min(h_inj*0.015, 0.08)) * league_pace
-    xa *= clamp(fa/15, 0.7, 1.2) * (1 - min(a_inj*0.015, 0.08)) * league_pace
-    return clamp(xh, 0.3, 3.5), clamp(xa, 0.3, 3.5), xh + xa
+    # Forma reciente robusta
+    fh_str = preds['teams']['home'].get('league', {}).get('form', 'WWDLD')[-5:]
+    fa_str = preds['teams']['away'].get('league', {}).get('form', 'WWDLD')[-5:]
+    
+    fh = fh_str.count('W')*3 + fh_str.count('D')
+    fa = fa_str.count('W')*3 + fa_str.count('D')
+    
+    fh = 7 if fh == 0 else fh
+    fa = 7 if fa == 0 else fa
+    
+    # Castigos y premios suavizados
+    xh *= clamp(fh/10, 0.85, 1.15) * (1 - min(h_inj*0.015, 0.08)) * league_pace
+    xa *= clamp(fa/10, 0.85, 1.15) * (1 - min(a_inj*0.015, 0.08)) * league_pace
+    
+    return clamp(xh, 0.5, 3.5), clamp(xa, 0.5, 3.5), xh + xa
 
 # ==========================================
-# CORE: RISK MANAGEMENT V5.6
+# CORE: RISK MANAGEMENT V5.6.1
 # ==========================================
 
 def calculate_final_stake(ev, odds, market, league_name):
@@ -199,7 +216,7 @@ class QuantFundNode:
         init_db()
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
         mode = "🔴 LIVE TRADING" if LIVE_TRADING else "🟡 DRY-RUN MODE (72h Burn-in)"
-        self.send_msg(f"🛡️ <b>QUANT FUND V5.6 DEPLOYED</b>\nEstado: {mode}\nNegBin, Asymmetric Kelly & Liquidity Tiers activos.")
+        self.send_msg(f"🛡️ <b>QUANT FUND V5.6.1 DEPLOYED</b>\nEstado: {mode}\nPesos Institucionales y Fix de xG inyectados.")
 
     def send_msg(self, text):
         if not TELEGRAM_TOKEN: return
@@ -298,15 +315,19 @@ class QuantFundNode:
             factors = get_league_factors(l_name)
             xh, xa, xt = synthetic_xg_model(preds, hinj, ainj, factors['pace'])
             
-            c_api = 0.45 if l_name in ['🏆 CHAMPIONS', '🇬🇧 PREMIER'] else 0.35
-            c_mkt = 1.0 - c_api
+            # --- PESOS INSTITUCIONALES ---
+            c_api = 0.15  # Modelo de la API
+            c_mkt = 0.85  # Mercado De-vigged
             m_probs = []
 
             for b in bets:
                 if b['id'] == 1:
                     for v in b['values']:
                         name = f"Gana {h_n}" if v['value'] == 'Home' else f"Gana {a_n}" if v['value'] == 'Away' else "Empate"
-                        p_api = float(preds['predictions']['percent'][v['value'].lower()].replace('%',''))/100
+                        try:
+                            p_api = float(preds['predictions']['percent'][v['value'].lower()].replace('%',''))/100
+                        except: p_api = 0.33
+                        
                         fp = (p_api * c_api) + ((1/float(v['odd'])/1.05) * c_mkt)
                         m_probs.append({"mkt": "1X2", "pick": name, "odd": float(v['odd']), "prob": fp, "bid": b['id']})
                 elif b['id'] == 5:
@@ -315,7 +336,8 @@ class QuantFundNode:
                             po, pu = calc_over_under_prob_adj(xt, 2.5, factors['std'])
                             mkt_type = "OVER" if 'Over' in v['value'] else "UNDER"
                             p_mod = po if mkt_type == "OVER" else pu
-                            fp = (p_mod * 0.6) + ((1/float(v['odd'])/1.07) * 0.4)
+                            
+                            fp = (p_mod * 0.35) + ((1/float(v['odd'])/1.07) * 0.65)
                             m_probs.append({"mkt": mkt_type, "pick": f"{v['value']} Goles", "odd": float(v['odd']), "prob": fp, "bid": b['id']})
 
             best_pick = None; max_ev = -1.0
@@ -323,7 +345,8 @@ class QuantFundNode:
                 ev = (item['prob'] * item['odd']) - 1
                 if ev > max_ev: max_ev, best_pick = ev, item
 
-            if best_pick and max_ev >= 0.05:
+            # Filtro robusto: Solo operar con EVs realistas (> 2% y < 20%)
+            if best_pick and 0.02 <= max_ev <= 0.20:
                 calc_stake = calculate_final_stake(max_ev, best_pick['odd'], best_pick['mkt'], l_name)
                 op_stake = calc_stake if LIVE_TRADING else 0.0 # DRY RUN OVERRIDE
                 
@@ -333,7 +356,6 @@ class QuantFundNode:
                              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (fid, l_name, h_n, a_n, best_pick['mkt'], best_pick['pick'], skey, best_pick['odd'], best_pick['prob'], max_ev, op_stake, xh, xa, xt, datetime.now(timezone.utc).isoformat(), ko))
                 conn.commit(); conn.close()
 
-                # Visual Output
                 prefix = "🟡 [DRY-RUN]" if not LIVE_TRADING else ("💎" if op_stake > 0 else "⚠️ [SHADOW]")
                 disp_stake = calc_stake if not LIVE_TRADING else op_stake
                 reports.append(f"⚽ {h_n} vs {a_n}\n{prefix} {best_pick['pick']} | @{best_pick['odd']} | EV: +{max_ev*100:.1f}%\nTarget Stake: {disp_stake*100:.2f}%")
