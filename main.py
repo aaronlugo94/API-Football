@@ -12,7 +12,7 @@ from math import exp, lgamma, log
 # ==========================================
 
 # --- SYSTEM FLAGS ---
-LIVE_TRADING = False  # Set to True ONLY after 72h burn-in
+LIVE_TRADING = False  # Set to True ONLY after 72h burn-in confirms realistic EVs
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -38,8 +38,15 @@ LIQUIDITY_TIERS = {
     '🇳🇱 EREDIVISIE': 0.75, '🇵🇹 PRIMEIRA': 0.75
 }
 
+# 10 Ligas repartidas en 7 días para no exceder cuota de API
 LEAGUE_UPDATE_SCHEDULE = {
-    0: 39, 1: 140, 2: 135, 3: 78, 4: 61, 5: 71, 6: 40
+    0: [39, 94],  # Lunes: Premier League + Primeira Liga
+    1: [140, 71], # Martes: La Liga + Eredivisie
+    2: [135, 40], # Miércoles: Serie A + Championship
+    3: [78],      # Jueves: Bundesliga
+    4: [61],      # Viernes: Ligue 1
+    5: [2],       # Sábado: Champions League
+    6: [3]        # Domingo: Europa League
 }
 
 # --- RISK PARAMETERS ---
@@ -50,7 +57,6 @@ KELLY_MULTIPLIER_BY_MARKET = {
     "1X2":   0.20    # Alta varianza
 }
 CLV_KILL_SWITCH_THRESHOLD = -0.015
-BASELINE_GOALS = 2.6
 
 # ==========================================
 # DATABASE & SCHEMA EVOLUTION
@@ -74,6 +80,28 @@ def init_db():
         goals_per_sot REAL, goal_std REAL, matches INTEGER, window_days INTEGER, last_updated DATETIME
     )""")
     
+    # --- AUTO-VACUNA DE BASELINES ---
+    c.execute("SELECT COUNT(*) FROM league_advanced_factors")
+    if c.fetchone()[0] == 0:
+        baselines = [
+            ('🇬🇧 PREMIER', 26.5, 9.2, 0.110, 0.32, 1.45),
+            ('🇪🇸 LA LIGA', 23.8, 8.1, 0.098, 0.29, 1.35),
+            ('🇮🇹 SERIE A', 24.2, 8.3, 0.102, 0.30, 1.38),
+            ('🇩🇪 BUNDESLIGA', 27.1, 9.5, 0.115, 0.33, 1.52),
+            ('🇫🇷 LIGUE 1', 24.0, 8.4, 0.100, 0.30, 1.36),
+            ('🏆 CHAMPIONS', 25.5, 9.0, 0.108, 0.31, 1.42),
+            ('🏆 EUROPA', 25.0, 8.8, 0.105, 0.30, 1.40),
+            ('🇳🇱 EREDIVISIE', 28.0, 10.0, 0.118, 0.34, 1.55),
+            ('🇵🇹 PRIMEIRA', 24.5, 8.5, 0.101, 0.30, 1.37),
+            ('🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP', 23.5, 8.0, 0.095, 0.28, 1.32)
+        ]
+        now = datetime.now(timezone.utc).isoformat()
+        for league, sh, sot, gps, gsot, std in baselines:
+            c.execute("""INSERT INTO league_advanced_factors 
+                         (league, shots_avg, shots_on_target_avg, goals_per_shot, goals_per_sot, goal_std, matches, window_days, last_updated) 
+                         VALUES (?,?,?,?,?,?, 100, 30, ?)""", (league, sh, sot, gps, gsot, std, now))
+        print("✅ Auto-Seed Completado: Promedios de liga inyectados.")
+
     # V5.6 Migration: Split 'GOALS' into 'OVER' / 'UNDER'
     c.execute("UPDATE picks_log SET market = 'OVER' WHERE market = 'GOALS' AND selection LIKE '%Over%'")
     c.execute("UPDATE picks_log SET market = 'UNDER' WHERE market = 'GOALS' AND selection LIKE '%Under%'")
@@ -183,35 +211,43 @@ class QuantFundNode:
         weekday = today.weekday()
         if weekday not in LEAGUE_UPDATE_SCHEDULE: return
         
-        league_id = LEAGUE_UPDATE_SCHEDULE[weekday]
-        league_name = TARGET_LEAGUES.get(league_id)
-        if not league_name: return
-        
-        season = today.year if today.month >= 8 else today.year - 1
-        teams = requests.get(f"https://v3.football.api-sports.io/teams?league={league_id}&season={season}", headers=self.headers, timeout=15).json().get("response", [])
-        
-        t_shots = t_sot = t_goals = 0; match_counts = []
-        for t in teams:
-            time.sleep(1.1)
-            stats = requests.get(f"https://v3.football.api-sports.io/teams/statistics?league={league_id}&season={season}&team={t['team']['id']}", headers=self.headers, timeout=15).json().get("response")
-            if not stats: continue
-            sh, sot, gls, m = stats['shots'].get('total', 0), stats['shots'].get('on', 0), stats['goals']['for']['total'].get('total', 0), stats['fixtures']['played'].get('total', 0)
-            if not sh or not gls or m == 0: continue
-            t_shots += sh; t_sot += (sot or 0); t_goals += gls; match_counts.append(m)
+        for league_id in LEAGUE_UPDATE_SCHEDULE[weekday]:
+            league_name = TARGET_LEAGUES.get(league_id)
+            if not league_name: continue
             
-        if not match_counts: return
-        
-        m_total = sum(match_counts) / 2
-        sh_avg, sot_avg = t_shots / m_total, t_sot / m_total
-        gps, gsot = t_goals / t_shots, t_goals / max(t_sot, 1)
-        std_proxy = np.sqrt(gps * sh_avg)
-        
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("""INSERT INTO league_advanced_factors (league, shots_avg, shots_on_target_avg, goals_per_shot, goals_per_sot, goal_std, matches, window_days, last_updated) 
-                     VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(league) DO UPDATE SET shots_avg=excluded.shots_avg, shots_on_target_avg=excluded.shots_on_target_avg, 
-                     goals_per_shot=excluded.goals_per_shot, goals_per_sot=excluded.goals_per_sot, goal_std=excluded.goal_std, last_updated=excluded.last_updated""", 
-                  (league_name, round(sh_avg, 2), round(sot_avg, 2), round(gps, 4), round(gsot, 4), round(std_proxy, 3), int(m_total), 30, today.isoformat()))
-        conn.commit(); conn.close()
+            season = today.year if today.month >= 8 else today.year - 1
+            try:
+                teams = requests.get(f"https://v3.football.api-sports.io/teams?league={league_id}&season={season}", headers=self.headers, timeout=15).json().get("response", [])
+            except: continue
+            
+            t_shots = t_sot = t_goals = 0
+            match_counts = []
+            
+            for t in teams:
+                time.sleep(1.1) # Rate limit safety
+                try:
+                    stats = requests.get(f"https://v3.football.api-sports.io/teams/statistics?league={league_id}&season={season}&team={t['team']['id']}", headers=self.headers, timeout=15).json().get("response")
+                    if not stats: continue
+                    sh, sot, gls, m = stats['shots'].get('total', 0), stats['shots'].get('on', 0), stats['goals']['for']['total'].get('total', 0), stats['fixtures']['played'].get('total', 0)
+                    if not sh or not gls or m == 0: continue
+                    t_shots += sh; t_sot += (sot or 0); t_goals += gls; match_counts.append(m)
+                except: continue
+                
+            if not match_counts: continue
+            
+            m_total = sum(match_counts) / 2
+            if m_total == 0: continue
+
+            sh_avg, sot_avg = t_shots / m_total, t_sot / m_total
+            gps, gsot = t_goals / t_shots, t_goals / max(t_sot, 1)
+            std_proxy = np.sqrt(gps * sh_avg)
+            
+            conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+            c.execute("""INSERT INTO league_advanced_factors (league, shots_avg, shots_on_target_avg, goals_per_shot, goals_per_sot, goal_std, matches, window_days, last_updated) 
+                         VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(league) DO UPDATE SET shots_avg=excluded.shots_avg, shots_on_target_avg=excluded.shots_on_target_avg, 
+                         goals_per_shot=excluded.goals_per_shot, goals_per_sot=excluded.goals_per_sot, goal_std=excluded.goal_std, last_updated=excluded.last_updated""", 
+                      (league_name, round(sh_avg, 2), round(sot_avg, 2), round(gps, 4), round(gsot, 4), round(std_proxy, 3), int(m_total), 30, today.isoformat()))
+            conn.commit(); conn.close()
 
     def capture_closing_lines(self):
         try:
@@ -238,17 +274,21 @@ class QuantFundNode:
         today, tomorrow = datetime.now().strftime("%Y-%m-%d"), (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         matches = []
         for d in [today, tomorrow]:
-            res = requests.get(f"https://v3.football.api-sports.io/fixtures?date={d}", headers=self.headers).json()
-            matches.extend([f for f in res.get('response', []) if f['league']['id'] in TARGET_LEAGUES])
+            try:
+                res = requests.get(f"https://v3.football.api-sports.io/fixtures?date={d}", headers=self.headers).json()
+                matches.extend([f for f in res.get('response', []) if f['league']['id'] in TARGET_LEAGUES])
+            except: pass
         
         for m in matches[:15]:
             fid, h_n, a_n = m['fixture']['id'], m['teams']['home']['name'], m['teams']['away']['name']
             l_name, ko = TARGET_LEAGUES[m['league']['id']], m['fixture']['date']
             
             time.sleep(6.1)
-            odds_res = requests.get(f"https://v3.football.api-sports.io/odds?fixture={fid}&bookmaker=8", headers=self.headers).json().get('response', [])
-            preds_res = requests.get(f"https://v3.football.api-sports.io/predictions?fixture={fid}", headers=self.headers).json().get('response', [])
-            inj_res = requests.get(f"https://v3.football.api-sports.io/injuries?fixture={fid}", headers=self.headers).json().get('response', [])
+            try:
+                odds_res = requests.get(f"https://v3.football.api-sports.io/odds?fixture={fid}&bookmaker=8", headers=self.headers).json().get('response', [])
+                preds_res = requests.get(f"https://v3.football.api-sports.io/predictions?fixture={fid}", headers=self.headers).json().get('response', [])
+                inj_res = requests.get(f"https://v3.football.api-sports.io/injuries?fixture={fid}", headers=self.headers).json().get('response', [])
+            except: continue
 
             if not odds_res or not preds_res: continue
             bets, preds = odds_res[0]['bookmakers'][0]['bets'], preds_res[0]
@@ -306,8 +346,7 @@ if __name__ == "__main__":
     schedule.every().day.at(RUN_TIME_INGEST).do(bot.update_league_advanced_factors)
     schedule.every(30).minutes.do(bot.capture_closing_lines)
     
-    # Run tests on boot
-    bot.update_league_advanced_factors()
+    # Check baseline injection and run a test scan on boot
     bot.run_daily_scan()
     
     while True:
