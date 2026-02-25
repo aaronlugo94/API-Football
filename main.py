@@ -39,7 +39,7 @@ VOLATILITY_BUCKETS = {
 TARGET_LEAGUES = {
     39: '🇬🇧 PREMIER', 140: '🇪🇸 LA LIGA', 135: '🇮🇹 SERIE A',
     78: '🇩🇪 BUNDESLIGA', 61: '🇫🇷 LIGUE 1', 2: '🏆 CHAMPIONS', 3: '🏆 EUROPA',
-    71: '🇳🇱 EREDIVISIE', 94: '🇵🇹 PRIMEIRA', 40: '🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP'
+    88: '🇳🇱 EREDIVISIE', 94: '🇵🇹 PRIMEIRA', 40: '🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP'
 }
 
 LIQUIDITY_TIERS = {
@@ -48,7 +48,7 @@ LIQUIDITY_TIERS = {
     '🇳🇱 EREDIVISIE': 0.75, '🇵🇹 PRIMEIRA': 0.75
 }
 
-LEAGUE_UPDATE_SCHEDULE = {0: [39, 94], 1: [140, 71], 2: [135, 40], 3: [78], 4: [61], 5: [2], 6: [3]}
+LEAGUE_UPDATE_SCHEDULE = {0: [39, 94], 1: [140, 88], 2: [135, 40], 3: [78], 4: [61], 5: [2], 6: [3]}
 
 # ==========================================
 # DATABASE & SCHEMA EVOLUTION
