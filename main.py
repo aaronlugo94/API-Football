@@ -392,6 +392,55 @@ if __name__ == "__main__":
     schedule.every().day.at(RUN_TIME_INGEST).do(bot.update_league_advanced_factors)
     schedule.every(30).minutes.do(bot.capture_closing_lines)
     
+    # --- AUDITOR DE LA MORGUE (DECISION LOG) ---
+    try:
+        print("\n🕵️‍♂️ --- INICIANDO AUDITORÍA DE RECHAZOS (LA MORGUE) --- 🕵️‍♂️")
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # 1. Resumen de por qué está rechazando
+        c.execute("""
+            SELECT reason, COUNT(*) 
+            FROM decision_log 
+            GROUP BY reason 
+            ORDER BY COUNT(*) DESC
+        """)
+        reasons = c.fetchall()
+        
+        print("\n📊 RESUMEN DE RECHAZOS (POR QUÉ EL BOT DIJO 'NO'):")
+        if not reasons:
+            print("La morgue está vacía. El bot no ha procesado partidos aún.")
+        else:
+            for r in reasons:
+                print(f"   ❌ {r[0]}: {r[1]} picks rechazados")
+        
+        # 2. Detalle de los últimos 10 partidos escaneados
+        c.execute("""
+            SELECT match, market, odd, ev, reason, timestamp 
+            FROM decision_log 
+            ORDER BY id DESC LIMIT 10
+        """)
+        last_picks = c.fetchall()
+        
+        if last_picks:
+            print("\n🔍 DETALLE DE LOS ÚLTIMOS 20 PARTIDOS RECHAZADOS:")
+            for p in last_picks:
+                match, market, odd, ev, reason, ts = p
+                # ts[:10] saca solo la fecha YYYY-MM-DD
+                print(f"[{ts[:20]}] {match} | {market} @{odd} | EV: +{ev*100:.1f}% -> Causa: {reason}")
+                
+        print("--------------------------------------------------\n")
+        conn.close()
+    except Exception as e:
+        print(f"Error en Auditoría: {e}")
+    # ----------------------------------------------
+
+    bot.run_daily_scan()
+    
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+    
     # --- AUDITOR AUTOMÁTICO DE ARRANQUE ---
     try:
         print("\n⏳ Iniciando Auditoría de CLV en la Base de Datos...")
