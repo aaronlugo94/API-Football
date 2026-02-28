@@ -310,7 +310,7 @@ class QuantFundNode:
         
         preliminary_picks = []
 
-        for m in matches[:15]:
+        for m in matches[:40]:
             fid, h_n, a_n, l_name, ko = m['fixture']['id'], m['teams']['home']['name'], m['teams']['away']['name'], TARGET_LEAGUES[m['league']['id']], m['fixture']['date']
             time.sleep(6.1)
             match_label = f"{h_n} vs {a_n}"
@@ -353,7 +353,7 @@ class QuantFundNode:
                 if max_ev < 0.02: log_rejection(fid, match_label, mkt, odd, max_ev, "LOW_EV"); continue
                 if max_ev > 0.20: log_rejection(fid, match_label, mkt, odd, max_ev, "EV_ALUCINATION"); continue
                 
-                aw_category = "💎 SIMPLE" if 1.60 <= odd <= 2.10 and prob > 0.55 else ("🧱 PARLAY" if 1.40 <= odd < 1.60 and prob > 0.65 else None)
+                aw_category = "💎 SIMPLE" if 1.60 <= odd <= 2.10 and prob > 0.50 else ("🧱 PARLAY" if 1.40 <= odd < 1.60 and prob > 0.60 else None)
                 if not aw_category: log_rejection(fid, match_label, mkt, odd, max_ev, "OUT_OF_ALWAYS_WIN_RANGE"); continue
                 
                 base_stake, urs_score, rejection_reason = get_base_kelly_and_urs(max_ev, odd, mkt, l_name)
