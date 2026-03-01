@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from math import exp, lgamma, log
 
 # ==========================================
-# V5.7.1 QUANT FUND CONFIGURATION
+# V5.8 QUANT FUND CONFIGURATION
 # ==========================================
 
 LIVE_TRADING = False  # SHADOW MODE: Burn-in required for the new CLV tracking
@@ -25,7 +25,7 @@ DB_PATH = os.path.join(DB_DIR, "quant_v5.db")
 RUN_TIME_SCAN = "02:50"
 RUN_TIME_INGEST = "04:00"
 
-# --- V5.7 PORTFOLIO RISK PARAMETERS ---
+# --- V5.8 PORTFOLIO RISK PARAMETERS ---
 MAX_DAILY_HEAT = 0.10
 TARGET_DAILY_VOLATILITY = 0.05
 
@@ -244,12 +244,55 @@ def calc_over_under_prob_adj(xg_total, line, league_std):
     p_under = sum(negbin_prob(xg_total, var, k) for k in range(int(np.floor(line)) + 1))
     return 1 - p_under, p_under
 
+# --- NUEVAS FUNCIONES V5.8 ---
+def build_market_probs_v58(bets, preds, xh, xa, xt, std_dev, h_n, a_n):
+    m_probs = []
+    for b in bets:
+        if b['id'] == 1:
+            api_keys = {'Home': 'home', 'Away': 'away', 'Draw': 'draw'}
+            raw = {}
+            total_raw = 0.0
+            for val_key, api_key in api_keys.items():
+                try: pct = float(preds['predictions']['percent'][api_key].replace('%', '')) / 100
+                except Exception: pct = 1/3
+                raw[val_key] = pct
+                total_raw += pct
+            for val_key in raw:
+                raw[val_key] = raw[val_key] / total_raw if total_raw > 0 else 1/3
+            for v in b['values']:
+                if v['value'] not in raw: continue
+                odd = float(v['odd'])
+                p_true = raw[v['value']]
+                p_implied = 1 / (odd * 1.05)
+                name = f"Gana {h_n}" if v['value'] == 'Home' else f"Gana {a_n}" if v['value'] == 'Away' else "Empate"
+                m_probs.append({"mkt": "1X2", "pick": name, "odd": odd, "prob": p_true, "bid": b['id'], "val": v['value'], "p_implied": p_implied, "model_gap": round(p_true - p_implied, 4)})
+        elif b['id'] == 5:
+            po, pu = calc_over_under_prob_adj(xt, 2.5, std_dev)
+            for v in b['values']:
+                if v['value'] not in ('Over 2.5', 'Under 2.5'): continue
+                mkt_type = "OVER" if 'Over' in v['value'] else "UNDER"
+                p_true = po if mkt_type == "OVER" else pu
+                odd = float(v['odd'])
+                p_implied = 1 / (odd * 1.07)
+                m_probs.append({"mkt": mkt_type, "pick": f"{v['value']} Goles", "odd": odd, "prob": p_true, "bid": b['id'], "val": v['value'], "p_implied": p_implied, "model_gap": round(p_true - p_implied, 4)})
+    return m_probs
+
+def sanity_check_prob(p_true, mkt_type, odd):
+    VIG = {"OVER": 1.07, "UNDER": 1.07, "1X2": 1.05}
+    vig = VIG.get(mkt_type, 1.06)
+    p_implied = 1 / (odd * vig)
+    gap = abs(p_true - p_implied)
+    if gap > 0.25:
+        return False, f"XG_SANITY_FAIL (gap={gap:.2f}, p_model={p_true:.2f}, p_impl={p_implied:.2f})"
+    return True, None
+# -----------------------------
+
 class QuantFundNode:
     def __init__(self):
         init_db()
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
         mode = "🔴 LIVE TRADING" if LIVE_TRADING else "🟡 DRY-RUN MODE (Batch Burn-in)"
-        self.send_msg(f"🛡️ <b>QUANT FUND V5.7.1 DEPLOYED</b>\nEstado: {mode}\nFix de CLV y Auto-Limpieza inyectados.")
+        self.send_msg(f"🛡️ <b>QUANT FUND V5.8 DEPLOYED</b>\nEstado: {mode}\nPure Pricing y Evaluador Estadístico activos.")
 
     def send_msg(self, text):
         if not TELEGRAM_TOKEN: return
@@ -275,7 +318,7 @@ class QuantFundNode:
                 except: continue
             m_total = sum(match_counts) / 2
             if m_total > 0:
-                sh_avg, sot_avg = t_shots / m_total, t_sot / m_total
+                sh_avg, sot_avg = t_shots / m_total
                 gps, gsot = t_goals / t_shots, t_goals / max(t_sot, 1)
                 std_proxy = np.sqrt(gps * sh_avg)
                 conn = sqlite3.connect(DB_PATH); c = conn.cursor()
@@ -293,7 +336,6 @@ class QuantFundNode:
                     if res.get('response'):
                         for b in res['response'][0]['bookmakers'][0]['bets']:
                             for v in b['values']:
-                                # FIX CLV: Buscar por el valor (nombre) de la apuesta, no por la cuota
                                 if f"{b['id']}|{v['value']}" == skey:
                                     c.execute("INSERT INTO closing_lines (fixture_id, market, selection_key, odd_close, implied_prob_close, capture_time) VALUES (?,?,?,?,?,?)", (fid, mkt, skey, float(v['odd']), 1/float(v['odd']), now.isoformat()))
                                     found = True; break
@@ -310,6 +352,7 @@ class QuantFundNode:
         
         preliminary_picks = []
 
+        # V5.8: Límite ampliado a 40 para no ahogar el fin de semana
         for m in matches[:40]:
             fid, h_n, a_n, l_name, ko = m['fixture']['id'], m['teams']['home']['name'], m['teams']['away']['name'], TARGET_LEAGUES[m['league']['id']], m['fixture']['date']
             time.sleep(6.1)
@@ -326,26 +369,19 @@ class QuantFundNode:
             factors = get_league_factors(l_name)
             xh, xa, xt = synthetic_xg_model(preds, hinj, ainj, factors['pace'])
             
-            c_api, c_mkt = 0.15, 0.85; m_probs = []
-            for b in bets:
-                if b['id'] == 1:
-                    for v in b['values']:
-                        name = f"Gana {h_n}" if v['value'] == 'Home' else f"Gana {a_n}" if v['value'] == 'Away' else "Empate"
-                        try: p_api = float(preds['predictions']['percent'][v['value'].lower()].replace('%',''))/100
-                        except: p_api = 0.33
-                        # FIX CLV: Añadido "val" al diccionario
-                        m_probs.append({"mkt": "1X2", "pick": name, "odd": float(v['odd']), "prob": (p_api * c_api) + ((1/float(v['odd'])/1.05) * c_mkt), "bid": b['id'], "val": v['value']})
-                elif b['id'] == 5:
-                    po, pu = calc_over_under_prob_adj(xt, 2.5, factors['std'])
-                    for v in b['values']:
-                        if v['value'] in ['Over 2.5', 'Under 2.5']:
-                            mkt_type = "OVER" if 'Over' in v['value'] else "UNDER"
-                            # FIX CLV: Añadido "val" al diccionario
-                            m_probs.append({"mkt": mkt_type, "pick": f"{v['value']} Goles", "odd": float(v['odd']), "prob": ((po if mkt_type == "OVER" else pu) * 0.35) + ((1/float(v['odd'])/1.07) * 0.65), "bid": b['id'], "val": v['value']})
+            # V5.8: Desacoplamiento de mercado y obtención de señal pura
+            m_probs = build_market_probs_v58(bets, preds, xh, xa, xt, factors['std'], h_n, a_n)
 
             best_pick, max_ev = None, -1.0
             for item in m_probs:
                 ev = (item['prob'] * item['odd']) - 1
+                
+                # V5.8: Sanity Check (evita EVs rotos por fallos en el modelo de xG)
+                ok, fail_reason = sanity_check_prob(item['prob'], item['mkt'], item['odd'])
+                if not ok:
+                    log_rejection(fid, match_label, item['mkt'], item['odd'], ev, fail_reason)
+                    continue
+
                 if ev > max_ev: max_ev, best_pick = ev, item
 
             if best_pick:
@@ -353,6 +389,7 @@ class QuantFundNode:
                 if max_ev < 0.02: log_rejection(fid, match_label, mkt, odd, max_ev, "LOW_EV"); continue
                 if max_ev > 0.20: log_rejection(fid, match_label, mkt, odd, max_ev, "EV_ALUCINATION"); continue
                 
+                # V5.8: Always Win ajustado para no descartar EVs fuertes
                 aw_category = "💎 SIMPLE" if 1.60 <= odd <= 2.10 and prob > 0.50 else ("🧱 PARLAY" if 1.40 <= odd < 1.60 and prob > 0.60 else None)
                 if not aw_category: log_rejection(fid, match_label, mkt, odd, max_ev, "OUT_OF_ALWAYS_WIN_RANGE"); continue
                 
@@ -361,18 +398,17 @@ class QuantFundNode:
                 
                 preliminary_picks.append({
                     'fid': fid, 'l_name': l_name, 'h_n': h_n, 'a_n': a_n, 'mkt': mkt, 'pick': best_pick['pick'],
-                    'skey': f"{best_pick['bid']}|{val}", # FIX CLV: Ahora se guarda el nombre (val), no la cuota
+                    'skey': f"{best_pick['bid']}|{val}",
                     'odd': odd, 'prob': prob, 'ev': max_ev,
                     'aw_category': aw_category, 'base_stake': base_stake, 'urs_score': urs_score,
                     'ko': ko, 'xh': xh, 'xa': xa, 'xt': xt
                 })
 
-        # --- PORTFOLIO RISK ENGINE BATCH EXECUTION ---
         final_picks, port_meta = apply_portfolio_risk_engine(preliminary_picks)
         
         if final_picks:
             conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-            reports = [f"📊 <b>Portfolio Metrics:</b>\nVol Proyectada: {port_meta['port_vol']*100:.2f}%\nDamper: {port_meta['damper']:.2f}x\nHeat Total: {port_meta['final_heat']*100:.2f}%"]
+            reports = [f"📊 <b>Portfolio Metrics (V5.8):</b>\nVol Proyectada: {port_meta['port_vol']*100:.2f}%\nDamper: {port_meta['damper']:.2f}x\nHeat Total: {port_meta['final_heat']*100:.2f}%"]
             
             for p in final_picks:
                 op_stake = p['final_stake'] if LIVE_TRADING else 0.0
@@ -392,56 +428,42 @@ if __name__ == "__main__":
     schedule.every().day.at(RUN_TIME_INGEST).do(bot.update_league_advanced_factors)
     schedule.every(30).minutes.do(bot.capture_closing_lines)
     
+    # --- V5.8: BURN-IN EVALUATOR ---
+    try:
+        from burn_in_evaluator import print_burn_in_report
+        print_burn_in_report(DB_PATH)
+    except Exception as e:
+        print(f"Burn-in evaluator no disponible (ignorando): {e}")
+
     # --- AUDITOR DE LA MORGUE (DECISION LOG) ---
     try:
         print("\n🕵️‍♂️ --- INICIANDO AUDITORÍA DE RECHAZOS (LA MORGUE) --- 🕵️‍♂️")
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         
-        # 1. Resumen de por qué está rechazando
-        c.execute("""
-            SELECT reason, COUNT(*) 
-            FROM decision_log 
-            GROUP BY reason 
-            ORDER BY COUNT(*) DESC
-        """)
+        c.execute("""SELECT reason, COUNT(*) FROM decision_log GROUP BY reason ORDER BY COUNT(*) DESC""")
         reasons = c.fetchall()
         
         print("\n📊 RESUMEN DE RECHAZOS (POR QUÉ EL BOT DIJO 'NO'):")
-        if not reasons:
-            print("La morgue está vacía. El bot no ha procesado partidos aún.")
+        if not reasons: print("La morgue está vacía. El bot no ha procesado partidos aún.")
         else:
-            for r in reasons:
-                print(f"   ❌ {r[0]}: {r[1]} picks rechazados")
+            for r in reasons: print(f"   ❌ {r[0]}: {r[1]} picks rechazados")
         
-        # 2. Detalle de los últimos 10 partidos escaneados
-        c.execute("""
-            SELECT match, market, odd, ev, reason, timestamp 
-            FROM decision_log 
-            ORDER BY id DESC LIMIT 10
-        """)
+        c.execute("""SELECT match, market, odd, ev, reason, timestamp FROM decision_log ORDER BY id DESC LIMIT 10""")
         last_picks = c.fetchall()
         
         if last_picks:
-            print("\n🔍 DETALLE DE LOS ÚLTIMOS 20 PARTIDOS RECHAZADOS:")
+            print("\n🔍 DETALLE DE LOS ÚLTIMOS 10 PARTIDOS RECHAZADOS:")
             for p in last_picks:
                 match, market, odd, ev, reason, ts = p
-                # ts[:10] saca solo la fecha YYYY-MM-DD
                 print(f"[{ts[:20]}] {match} | {market} @{odd} | EV: +{ev*100:.1f}% -> Causa: {reason}")
                 
         print("--------------------------------------------------\n")
         conn.close()
     except Exception as e:
-        print(f"Error en Auditoría: {e}")
-    # ----------------------------------------------
+        print(f"Error en Auditoría de la Morgue: {e}")
 
-    bot.run_daily_scan()
-    
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
-    
-    # --- AUDITOR AUTOMÁTICO DE ARRANQUE ---
+    # --- AUDITOR AUTOMÁTICO DE CLV ---
     try:
         print("\n⏳ Iniciando Auditoría de CLV en la Base de Datos...")
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
@@ -465,7 +487,7 @@ if __name__ == "__main__":
             print(f"Líneas de cierre ganadas (Beats): {beats} ({beats/len(picks)*100:.1f}%)")
             print(f"CLV Promedio Global: {avg_clv:.2f}%\n")
     except Exception as e:
-        print(f"Error en Auditoría: {e}")
+        print(f"Error en Auditoría CLV: {e}")
     
     bot.run_daily_scan()
     
