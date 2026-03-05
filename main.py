@@ -282,8 +282,19 @@ def validate_xg_consistency(xh, xa, bets):
     Retorna (True, None) si el xG es consistente con el mercado.
     Retorna (False, reason) si hay inconsistencia detectada.
     """
-    # Extraer cuota del favorito del mercado 1X2
+def validate_xg_consistency(xh, xa, bets):
+    """
+    V5.10: Detecta xG inválido comparando contra cuotas del mercado.
+
+    Validaciones:
+    1. Si hay gran favorito 1X2, el xG debe reflejarlo.
+    2. Si el xG total es inconsistente con las cuotas Over/Under, rechazar.
+       Ejemplo: xG total = 4.2 pero Over 2.5 paga @2.50 (implica solo 38%).
+       Eso significa que el mercado ve un partido cerrado pero nuestro xG ve goleada.
+    """
     home_odd = away_odd = None
+    over_odd = under_odd = None
+
     for b in bets:
         if b['id'] == 1:
             for v in b['values']:
@@ -291,29 +302,51 @@ def validate_xg_consistency(xh, xa, bets):
                     if v['value'] == 'Home': home_odd = float(v['odd'])
                     if v['value'] == 'Away': away_odd = float(v['odd'])
                 except: pass
+        elif b['id'] == 5:
+            for v in b['values']:
+                try:
+                    if v['value'] == 'Over 2.5':  over_odd  = float(v['odd'])
+                    if v['value'] == 'Under 2.5': under_odd = float(v['odd'])
+                except: pass
 
-    if home_odd is None or away_odd is None:
-        return True, None  # sin cuotas para validar, continuar
-
-    min_odd = min(home_odd, away_odd)
-    max_odd = max(home_odd, away_odd)
-
-    # Si hay un gran favorito (cuota < 1.40), verificar que el xG lo refleje
-    if min_odd < 1.40:
+    # ── Validación 1X2: xG debe reflejar el favorito ────────
+    if home_odd and away_odd:
+        min_odd = min(home_odd, away_odd)
         xg_ratio = max(xh, xa) / min(xh, xa) if min(xh, xa) > 0 else 1.0
-        # Con favorito a < 1.40, el xG dominante debe ser al menos 1.5x el otro
-        if xg_ratio < 1.50:
+
+        if min_odd < 1.40 and xg_ratio < 1.50:
             return False, f"XG_DEFAULT_DETECTED (min_odd={min_odd:.2f}, xg_ratio={xg_ratio:.2f}, xh={xh:.2f}, xa={xa:.2f})"
 
-    # Si hay un favorito moderado (cuota 1.40-1.65), xG ratio debe ser > 1.2
-    elif min_odd < 1.65:
-        xg_ratio = max(xh, xa) / min(xh, xa) if min(xh, xa) > 0 else 1.0
-        if xg_ratio < 1.20:
+        elif min_odd < 1.65 and xg_ratio < 1.20:
             return False, f"XG_FLAT_ON_FAVOURITE (min_odd={min_odd:.2f}, xg_ratio={xg_ratio:.2f})"
 
-    # Detectar zona de default explícita: ambos xG entre 1.30-1.50
-    if 1.30 <= xh <= 1.50 and 1.30 <= xa <= 1.50 and min_odd < 1.60:
-        return False, f"XG_LIKELY_DEFAULT (xh={xh:.2f}, xa={xa:.2f}, favourite_odd={min_odd:.2f})"
+        if 1.30 <= xh <= 1.50 and 1.30 <= xa <= 1.50 and min_odd < 1.60:
+            return False, f"XG_LIKELY_DEFAULT (xh={xh:.2f}, xa={xa:.2f}, favourite_odd={min_odd:.2f})"
+
+    # ── Validación Over/Under: xG total coherente con mercado ──
+    if over_odd and under_odd:
+        # Probabilidad implícita Over 2.5 del mercado (sin vig)
+        p_over_market  = 1 / (over_odd  * 1.07)
+        p_under_market = 1 / (under_odd * 1.07)
+
+        # xG total esperado según el mercado:
+        # Si Over paga @1.50 (67%), el mercado espera un partido con ~2.8-3.2 goles
+        # Si Under paga @1.50 (67%), el mercado espera ~1.5-2.0 goles
+        # Usamos la relación empírica: xG_market_implied ≈ -2.5 * ln(p_under_market)
+        import math as _math
+        if p_under_market > 0.01:
+            xg_market_implied = -2.5 * _math.log(p_under_market)
+            xg_total = xh + xa
+
+            # Si nuestro xG difiere más de 1.8 goles del implícito del mercado,
+            # los datos son sospechosos
+            gap_xg = abs(xg_total - xg_market_implied)
+            if gap_xg > 1.8:
+                return False, (
+                    f"XG_TOTAL_INCONSISTENT "
+                    f"(xg_model={xg_total:.2f}, xg_market={xg_market_implied:.2f}, "
+                    f"gap={gap_xg:.2f}, over_odd={over_odd})"
+                )
 
     return True, None
 
@@ -545,7 +578,7 @@ class QuantFundNode:
             f"🛡️ <b>QUANT FUND V5.10 DEPLOYED</b>\n"
             f"Estado: {mode}\n"
             f"Mercados: 1X2 · Over/Under · BTTS\n"
-            f"Fix: xG default detection · EV máx 15% · confianza de datos"
+            f"Fix: xG default · xG vs O/U market · EV máx 15%"
         )
 
     def send_msg(self, text):
