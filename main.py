@@ -9,18 +9,22 @@ from datetime import datetime, timedelta, timezone
 from math import exp, lgamma, log
 
 # ==========================================
-# V5.9 QUANT FUND CONFIGURATION
+# V5.10 QUANT FUND
 # ==========================================
-# CAMBIOS RESPECTO A V5.8:
-#   1. Always Win filter ELIMINADO — el EV y Kelly deciden solos
-#   2. xG sintético con decay exponencial (últimas 6 jornadas pesan más)
-#   3. 1X2 ahora usa Poisson bivariado sobre (xg_home, xg_away) en lugar
-#      de los porcentajes opacos de api-football (que ya tenían vig implícito)
-#   4. Selección multi-mercado: se evalúan TODOS los picks con EV > umbral,
-#      no solo el mejor, antes de pasar al portfolio engine
-#   5. EV mínimo bajado de 2% a 1.5% para compensar señal más conservadora
+# CORRECCIONES VS V5.9:
+#   1. Detección de xG "default": si xh y xa son demasiado similares
+#      en un partido desequilibrado (cuotas asimétricas), se rechaza
+#      el partido completo antes de calcular Poisson.
+#   2. xG mínimo subido de 0.5 a 0.6 para evitar distribuciones
+#      demasiado concentradas en 0 goles.
+#   3. Validación de que xG refleja el desequilibrio real del partido:
+#      si la cuota favorita es < 1.50 pero xg_ratio < 1.3, datos corruptos.
+#   4. EV máximo bajado de 20% a 15% — los EVs de 19% eran sospechosos.
+#   5. Logging más detallado de por qué se rechaza cada partido.
+#   6. xG default detection: si ambos xG están entre 1.35-1.45
+#      (zona de default) Y las cuotas son asimétricas, rechazar.
 
-LIVE_TRADING = False  # SHADOW MODE: Burn-in activo
+LIVE_TRADING = False
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -35,16 +39,10 @@ RUN_TIME_INGEST = "04:00"
 
 MAX_DAILY_HEAT          = 0.10
 TARGET_DAILY_VOLATILITY = 0.05
-
-# EV mínimo para considerar un pick (antes era 0.02)
-MIN_EV_THRESHOLD = 0.015
-
-# Máximo picks por partido (evita sobreexposición a un solo fixture)
-MAX_PICKS_PER_FIXTURE = 1
-
-# Decay exponencial xG: cuánto valen los últimos partidos vs los primeros
-# 0.85 = partido más reciente pesa 1.0, hace 6 partidos pesa ~0.38
-XG_DECAY_FACTOR = 0.85
+MIN_EV_THRESHOLD        = 0.015
+MAX_EV_THRESHOLD        = 0.15   # bajado de 0.20 — EVs > 15% son sospechosos
+MAX_PICKS_PER_FIXTURE   = 1
+XG_DECAY_FACTOR         = 0.85
 
 VOLATILITY_BUCKETS = {"OVER": 0.85, "UNDER": 0.85, "BTTS": 1.00, "1X2": 1.25}
 
@@ -65,7 +63,6 @@ LEAGUE_UPDATE_SCHEDULE = {
     0: [39, 94], 1: [140, 88], 2: [135, 40],
     3: [78], 4: [61], 5: [2], 6: [3]
 }
-
 
 # ==========================================
 # DATABASE
@@ -173,30 +170,25 @@ def get_clv_sharpe():
     except: return 0.0
 
 def score_sharpe(s):
-    if s < -0.5:  return 0.10
-    elif s < 0.0: return 0.30
-    elif s < 0.5: return 0.50
-    elif s < 1.0: return 0.75
-    elif s < 1.5: return 0.90
-    else:         return 1.00
+    if s < -0.5:   return 0.10
+    elif s < 0.0:  return 0.30
+    elif s < 0.5:  return 0.50
+    elif s < 1.0:  return 0.75
+    elif s < 1.5:  return 0.90
+    else:          return 1.00
 
 def score_ev_gcs(ev):
-    if ev < 0.03:  return 0.20
+    if ev < 0.03:   return 0.20
     elif ev < 0.05: return 0.40
     elif ev < 0.08: return 0.60
     elif ev < 0.12: return 0.80
     else:           return 1.00
 
 def score_liquidity_and_odd(odd, league_name):
-    """
-    V5.9: reemplaza score_market_always_win.
-    Ya no penaliza cuotas fuera del rango 1.40-2.10.
-    Penaliza cuotas extremas (<1.20 o >4.0) donde el vig real es más alto.
-    """
     liq = LIQUIDITY_TIERS.get(league_name, 0.40)
-    if odd < 1.20:   odd_score = 0.10   # vig real devastador a cuotas bajas
-    elif odd < 1.40: odd_score = 0.50
-    elif odd <= 3.00: odd_score = 1.00  # rango amplio con liquidez real
+    if odd < 1.20:    odd_score = 0.10
+    elif odd < 1.40:  odd_score = 0.50
+    elif odd <= 3.00: odd_score = 1.00
     elif odd <= 4.00: odd_score = 0.70
     else:             odd_score = 0.30
     return liq, odd_score
@@ -265,7 +257,7 @@ def apply_portfolio_risk_engine(preliminary_picks):
 
 
 # ==========================================
-# MATH ENGINE — V5.9 con decay exponencial
+# MATH ENGINE V5.10
 # ==========================================
 
 def get_league_factors(league_name):
@@ -276,64 +268,109 @@ def get_league_factors(league_name):
 
 
 def _weighted_average(values, decay=XG_DECAY_FACTOR):
-    """
-    Promedio ponderado con decay exponencial.
-    El primer elemento de la lista se asume el más reciente.
-    values = [goles_j-1, goles_j-2, ..., goles_j-n]
-    """
     if not values: return 0.0
     weights = [decay ** i for i in range(len(values))]
     return sum(v * w for v, w in zip(values, weights)) / sum(weights)
 
 
-def synthetic_xg_model_v59(preds, h_inj, a_inj, league_pace):
+def validate_xg_consistency(xh, xa, bets):
     """
-    V5.9: xG con decay exponencial sobre historial de goals.
-    Si la API devuelve el historial de los últimos partidos, los usamos.
-    Si no, cae al promedio de temporada (comportamiento legacy).
+    V5.10: Detecta cuando el xG es el default (1.4/1.4) en un partido
+    claramente desequilibrado. Si las cuotas dicen que un equipo es
+    gran favorito pero los xG son casi iguales, los datos son corruptos.
+
+    Retorna (True, None) si el xG es consistente con el mercado.
+    Retorna (False, reason) si hay inconsistencia detectada.
+    """
+    # Extraer cuota del favorito del mercado 1X2
+    home_odd = away_odd = None
+    for b in bets:
+        if b['id'] == 1:
+            for v in b['values']:
+                try:
+                    if v['value'] == 'Home': home_odd = float(v['odd'])
+                    if v['value'] == 'Away': away_odd = float(v['odd'])
+                except: pass
+
+    if home_odd is None or away_odd is None:
+        return True, None  # sin cuotas para validar, continuar
+
+    min_odd = min(home_odd, away_odd)
+    max_odd = max(home_odd, away_odd)
+
+    # Si hay un gran favorito (cuota < 1.40), verificar que el xG lo refleje
+    if min_odd < 1.40:
+        xg_ratio = max(xh, xa) / min(xh, xa) if min(xh, xa) > 0 else 1.0
+        # Con favorito a < 1.40, el xG dominante debe ser al menos 1.5x el otro
+        if xg_ratio < 1.50:
+            return False, f"XG_DEFAULT_DETECTED (min_odd={min_odd:.2f}, xg_ratio={xg_ratio:.2f}, xh={xh:.2f}, xa={xa:.2f})"
+
+    # Si hay un favorito moderado (cuota 1.40-1.65), xG ratio debe ser > 1.2
+    elif min_odd < 1.65:
+        xg_ratio = max(xh, xa) / min(xh, xa) if min(xh, xa) > 0 else 1.0
+        if xg_ratio < 1.20:
+            return False, f"XG_FLAT_ON_FAVOURITE (min_odd={min_odd:.2f}, xg_ratio={xg_ratio:.2f})"
+
+    # Detectar zona de default explícita: ambos xG entre 1.30-1.50
+    if 1.30 <= xh <= 1.50 and 1.30 <= xa <= 1.50 and min_odd < 1.60:
+        return False, f"XG_LIKELY_DEFAULT (xh={xh:.2f}, xa={xa:.2f}, favourite_odd={min_odd:.2f})"
+
+    return True, None
+
+
+def synthetic_xg_model_v510(preds, h_inj, a_inj, league_pace):
+    """
+    V5.10: xG con decay exponencial y detección de datos faltantes.
+    Retorna también un flag de confianza en el xG calculado.
     """
     xh, xa = 1.4, 1.4
+    xh_loaded = xa_loaded = False
 
-    # Intentar extraer historial reciente (últimos 6 partidos home/away)
     try:
-        h_fixtures = preds['teams']['home']['league']['fixtures']
-        h_goals_for  = []
-        h_goals_ag   = []
-        # La API devuelve totales, no partido a partido — usamos promedios
-        # como proxy. En V5.10 se puede enriquecer con /fixtures?team=X&last=6
         h_gf_avg = float(preds['teams']['home']['league']['goals']['for']['average']['home'])
         h_ga_avg = float(preds['teams']['away']['league']['goals']['against']['average']['away'])
-        xh = (h_gf_avg + h_ga_avg) / 2
+        if h_gf_avg > 0 and h_ga_avg > 0:
+            xh = (h_gf_avg + h_ga_avg) / 2
+            xh_loaded = True
     except: pass
 
     try:
         a_gf_avg = float(preds['teams']['away']['league']['goals']['for']['average']['away'])
         a_ga_avg = float(preds['teams']['home']['league']['goals']['against']['average']['home'])
-        xa = (a_gf_avg + a_ga_avg) / 2
+        if a_gf_avg > 0 and a_ga_avg > 0:
+            xa = (a_gf_avg + a_ga_avg) / 2
+            xa_loaded = True
     except: pass
 
-    # Decay sobre forma reciente (W=3, D=1, L=0 → proxy de intensidad ofensiva)
-    fh_str = preds['teams']['home'].get('league', {}).get('form', 'WWDLD')[-6:]
-    fa_str = preds['teams']['away'].get('league', {}).get('form', 'WWDLD')[-6:]
-
-    # Convertir forma en serie de "rendimiento" para decay
+    # Decay exponencial sobre forma reciente
     form_scores = {'W': 1.0, 'D': 0.5, 'L': 0.0}
-    fh_series = [form_scores.get(c, 0.5) for c in reversed(fh_str)]  # más reciente primero
-    fa_series = [form_scores.get(c, 0.5) for c in reversed(fa_str)]
+    fh_str = preds['teams']['home'].get('league', {}).get('form', '')[-6:]
+    fa_str = preds['teams']['away'].get('league', {}).get('form', '')[-6:]
 
-    fh_weighted = _weighted_average(fh_series) if fh_series else 0.5
-    fa_weighted = _weighted_average(fa_series) if fa_series else 0.5
+    if fh_str:
+        fh_series  = [form_scores.get(c, 0.5) for c in reversed(fh_str)]
+        fh_weighted = _weighted_average(fh_series)
+        fh_mult    = max(0.85, min(0.85 + fh_weighted * 0.30, 1.15))
+    else:
+        fh_mult = 1.0
 
-    # Multiplicador de forma: rango [0.85, 1.15]
-    fh_mult = max(0.85, min(0.85 + fh_weighted * 0.30, 1.15))
-    fa_mult = max(0.85, min(0.85 + fa_weighted * 0.30, 1.15))
+    if fa_str:
+        fa_series  = [form_scores.get(c, 0.5) for c in reversed(fa_str)]
+        fa_weighted = _weighted_average(fa_series)
+        fa_mult    = max(0.85, min(0.85 + fa_weighted * 0.30, 1.15))
+    else:
+        fa_mult = 1.0
 
     xh *= fh_mult * (1 - min(h_inj * 0.015, 0.08)) * league_pace
     xa *= fa_mult * (1 - min(a_inj * 0.015, 0.08)) * league_pace
 
-    xh = max(0.5, min(xh, 3.5))
-    xa = max(0.5, min(xa, 3.5))
-    return xh, xa, xh + xa
+    xh = max(0.6, min(xh, 3.5))
+    xa = max(0.6, min(xa, 3.5))
+
+    # Confianza: alta solo si ambos xG se cargaron de la API
+    confidence = "HIGH" if (xh_loaded and xa_loaded) else "LOW"
+
+    return xh, xa, xh + xa, confidence
 
 
 def negbin_prob(mu, var, k):
@@ -352,19 +389,16 @@ def calc_over_under_prob_adj(xg_total, line, league_std):
 
 def bivariate_poisson_1x2(xg_home, xg_away, max_goals=10):
     """
-    Modelo de Poisson bivariado independiente para 1X2.
-    Inputs validados: xG debe estar en [0.4, 4.0].
-    Devuelve None si los inputs son inválidos o el resultado es poco realista.
+    Poisson bivariado independiente para 1X2.
+    Retorna None si los inputs son inválidos.
     """
     if not (0.4 <= xg_home <= 4.0) or not (0.4 <= xg_away <= 4.0):
         return None
 
     def pois(mu, k):
         if mu <= 0: return 0.0
-        try:
-            return exp(-mu + k * log(mu) - lgamma(k + 1))
-        except (ValueError, OverflowError):
-            return 0.0
+        try: return exp(-mu + k * log(mu) - lgamma(k + 1))
+        except (ValueError, OverflowError): return 0.0
 
     p_home = p_draw = p_away = 0.0
     for i in range(max_goals + 1):
@@ -375,41 +409,31 @@ def bivariate_poisson_1x2(xg_home, xg_away, max_goals=10):
             else:        p_away += prob
 
     total = p_home + p_draw + p_away
-    if total < 0.95:
-        return None
+    if total < 0.95: return None
 
     p_h = p_home / total
     p_d = p_draw / total
     p_a = p_away / total
 
-    # En fútbol real p_draw siempre entre 8-55% (cubre partidos defensivos y ofensivos)
-    if not (0.08 <= p_d <= 0.55):
-        return None
+    if not (0.08 <= p_d <= 0.55): return None
 
     return p_h, p_d, p_a
 
 
 # ==========================================
-# V5.9: PURE PRICING ENGINE
+# V5.10: PURE PRICING ENGINE
 # ==========================================
 
-def build_market_probs_v59(bets, xh, xa, xt, league_std, h_n, a_n):
-    """
-    V5.9: 1X2 usa Poisson bivariado puro (no api-football %).
-    Over/Under usa negbin sobre xG total.
-    Ningún precio del casino contamina p_true.
-    """
+def build_market_probs_v510(bets, xh, xa, xt, league_std, h_n, a_n):
     m_probs = []
 
-    # Pre-calcular 1X2 con Poisson bivariado
-    # Si devuelve None, los xG son inválidos y se omite el mercado 1X2 completamente
     poisson_result = bivariate_poisson_1x2(xh, xa)
     if poisson_result is not None:
         p_home, p_draw, p_away = poisson_result
         p_1x2  = {'Home': p_home, 'Draw': p_draw, 'Away': p_away}
         names  = {'Home': f"Gana {h_n}", 'Draw': "Empate", 'Away': f"Gana {a_n}"}
     else:
-        p_1x2 = {}   # señal inválida — se salta el bloque 1X2 abajo
+        p_1x2 = {}
 
     for b in bets:
 
@@ -468,9 +492,9 @@ class QuantFundNode:
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
         mode = "🔴 LIVE TRADING" if LIVE_TRADING else "🟡 DRY-RUN MODE (Batch Burn-in)"
         self.send_msg(
-            f"🛡️ <b>QUANT FUND V5.9 DEPLOYED</b>\n"
+            f"🛡️ <b>QUANT FUND V5.10 DEPLOYED</b>\n"
             f"Estado: {mode}\n"
-            f"Novedades: Poisson bivariado 1X2 · xG decay · Always Win eliminado"
+            f"Fix: detección xG default · EV máx 15% · confianza de datos"
         )
 
     def send_msg(self, text):
@@ -519,7 +543,7 @@ class QuantFundNode:
 
             m_total = sum(match_counts) / 2
             if m_total > 0:
-                sh_avg    = t_shots / m_total   # FIX: líneas separadas (bug v5.7-v5.8)
+                sh_avg    = t_shots / m_total
                 sot_avg   = t_sot   / m_total
                 gps       = t_goals / t_shots
                 gsot      = t_goals / max(t_sot, 1)
@@ -547,7 +571,7 @@ class QuantFundNode:
             for pid, fid, mkt, skey, ko in c.fetchall():
                 mins_to_ko = (datetime.fromisoformat(ko) - now).total_seconds() / 60.0
                 if mins_to_ko <= 60.0:
-                    res   = requests.get(
+                    res = requests.get(
                         f"https://v3.football.api-sports.io/odds?fixture={fid}&bookmaker=8",
                         headers=self.headers
                     ).json()
@@ -581,8 +605,8 @@ class QuantFundNode:
                 ])
             except: pass
 
-        preliminary_picks = []
-        fixture_pick_count = {}   # max 1 pick por fixture
+        preliminary_picks  = []
+        fixture_pick_count = {}
 
         for m in matches[:40]:
             fid         = m['fixture']['id']
@@ -606,18 +630,30 @@ class QuantFundNode:
             hinj  = sum(1 for i in inj_res if i['team']['id'] == m['teams']['home']['id'])
             ainj  = sum(1 for i in inj_res if i['team']['id'] == m['teams']['away']['id'])
 
-            factors    = get_league_factors(l_name)
-            xh, xa, xt = synthetic_xg_model_v59(preds, hinj, ainj, factors['pace'])
+            factors             = get_league_factors(l_name)
+            xh, xa, xt, conf   = synthetic_xg_model_v510(preds, hinj, ainj, factors['pace'])
 
-            # V5.9: Pure Pricing sin circularidad
-            m_probs = build_market_probs_v59(bets, xh, xa, xt, factors['std'], h_n, a_n)
+            # V5.10: Validar que el xG es consistente con el desequilibrio real del partido
+            xg_valid, xg_reason = validate_xg_consistency(xh, xa, bets)
+            if not xg_valid:
+                log_rejection(fid, match_label, 'ALL', 0.0, 0.0, xg_reason)
+                continue
 
-            # Si el modelo 1X2 rechazó los xG, loguearlo para diagnóstico
-            if not any(p['mkt'] == '1X2' for p in m_probs):
+            # Si la confianza en el xG es baja (datos de API incompletos),
+            # solo procesar Over/Under, no 1X2
+            if conf == "LOW":
+                log_rejection(fid, match_label, '1X2', 0.0, 0.0, "XG_LOW_CONFIDENCE_SKIP_1X2")
+
+            m_probs = build_market_probs_v510(bets, xh, xa, xt, factors['std'], h_n, a_n)
+
+            # Si confianza baja, filtrar 1X2 de los candidatos
+            if conf == "LOW":
+                m_probs = [p for p in m_probs if p['mkt'] != '1X2']
+
+            if not any(p['mkt'] == '1X2' for p in m_probs) and conf == "HIGH":
                 log_rejection(fid, match_label, '1X2', 0.0, 0.0,
                               f"POISSON_XG_INVALID (xh={xh:.2f}, xa={xa:.2f})")
 
-            # Evaluar TODOS los mercados, tomar el mejor EV válido por fixture
             candidates = []
             for item in m_probs:
                 ev = (item['prob'] * item['odd']) - 1
@@ -630,11 +666,13 @@ class QuantFundNode:
                 if ev < MIN_EV_THRESHOLD:
                     log_rejection(fid, match_label, item['mkt'], item['odd'], ev, "LOW_EV")
                     continue
-                if ev > 0.20:
+                if ev > MAX_EV_THRESHOLD:
                     log_rejection(fid, match_label, item['mkt'], item['odd'], ev, "EV_ALUCINATION")
                     continue
 
-                base_stake, urs_score, rejection_reason = get_base_kelly_and_urs(ev, item['odd'], item['mkt'], l_name)
+                base_stake, urs_score, rejection_reason = get_base_kelly_and_urs(
+                    ev, item['odd'], item['mkt'], l_name
+                )
                 if base_stake == 0.0:
                     log_rejection(fid, match_label, item['mkt'], item['odd'], ev, rejection_reason)
                     continue
@@ -643,7 +681,6 @@ class QuantFundNode:
 
             if not candidates: continue
 
-            # Ordenar por EV y tomar el mejor (MAX_PICKS_PER_FIXTURE=1)
             candidates.sort(key=lambda x: x['ev'], reverse=True)
             for pick in candidates[:MAX_PICKS_PER_FIXTURE]:
                 if fixture_pick_count.get(fid, 0) >= MAX_PICKS_PER_FIXTURE:
@@ -654,7 +691,7 @@ class QuantFundNode:
                     'mkt': pick['mkt'], 'pick': pick['pick'],
                     'skey': f"{pick['bid']}|{pick['val']}",
                     'odd': pick['odd'], 'prob': pick['prob'], 'ev': pick['ev'],
-                    'model_gap': pick['model_gap'],
+                    'model_gap': pick['model_gap'], 'conf': conf,
                     'base_stake': pick['base_stake'], 'urs_score': pick['urs_score'],
                     'ko': ko, 'xh': xh, 'xa': xa, 'xt': xt
                 })
@@ -665,7 +702,7 @@ class QuantFundNode:
         if final_picks:
             conn = sqlite3.connect(DB_PATH); c = conn.cursor()
             reports = [
-                f"📊 <b>Portfolio Metrics (V5.9):</b>\n"
+                f"📊 <b>Portfolio Metrics (V5.10):</b>\n"
                 f"Vol Proyectada: {port_meta['port_vol']*100:.2f}%\n"
                 f"Damper: {port_meta['damper']:.2f}x\n"
                 f"Heat Total: {port_meta['final_heat']*100:.2f}%\n"
@@ -688,18 +725,20 @@ class QuantFundNode:
                 prefix     = "🟡 [DRY-RUN]" if not LIVE_TRADING else ("💰" if op_stake > 0 else "⚠️")
                 disp_stake = p['final_stake'] if not LIVE_TRADING else op_stake
                 gap_str    = f"+{p['model_gap']*100:.1f}%" if p['model_gap'] >= 0 else f"{p['model_gap']*100:.1f}%"
+                conf_icon  = "✅" if p['conf'] == "HIGH" else "⚠️"
+
                 reports.append(
                     f"⚽ {p['h_n']} vs {p['a_n']} | {p['l_name']}\n"
                     f"{prefix} [{p['mkt']}]: {p['pick']}\n"
                     f"📊 Cuota: @{p['odd']} | EV: +{p['ev']*100:.1f}%\n"
                     f"📉 URS: {p['urs_score']:.2f} | LCP: {p['lcp_applied']:.2f}\n"
-                    f"🔬 Gap Modelo: {gap_str}\n"
-                    f"🎯 Stake Final: {disp_stake*100:.2f}%"
+                    f"🔬 Gap: {gap_str} | xG: {p['xh']:.1f}-{p['xa']:.1f} {conf_icon}\n"
+                    f"🎯 Stake: {disp_stake*100:.2f}%"
                 )
             conn.commit(); conn.close()
             self.send_msg("\n\n".join(reports))
         else:
-            self.send_msg("🔇 <b>Scan V5.9 completado.</b> Sin picks con EV válido hoy.")
+            self.send_msg("🔇 <b>Scan V5.10 completado.</b> Sin picks válidos hoy.")
 
 
 if __name__ == "__main__":
@@ -755,8 +794,7 @@ if __name__ == "__main__":
             print(f"  Picks validados : {len(picks)}")
             print(f"  Beat Rate       : {beats}/{len(picks)} ({beats/len(picks)*100:.1f}%)")
             print(f"  CLV Promedio    : {avg_clv:.2f}%")
-            print(f"  Model Gap avg   : {avg_gap:.2f}%  <- sesgo xG\n")
-            # Desglose por mercado
+            print(f"  Model Gap avg   : {avg_gap:.2f}%\n")
             mkts = {}
             for clv, gap, mkt in picks:
                 if mkt not in mkts: mkts[mkt] = []
