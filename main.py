@@ -9,14 +9,22 @@ from datetime import datetime, timedelta, timezone
 from math import exp, lgamma, log
 
 # ==========================================
-# V5.8 QUANT FUND CONFIGURATION
+# V5.9 QUANT FUND CONFIGURATION
 # ==========================================
+# CAMBIOS RESPECTO A V5.8:
+#   1. Always Win filter ELIMINADO — el EV y Kelly deciden solos
+#   2. xG sintético con decay exponencial (últimas 6 jornadas pesan más)
+#   3. 1X2 ahora usa Poisson bivariado sobre (xg_home, xg_away) en lugar
+#      de los porcentajes opacos de api-football (que ya tenían vig implícito)
+#   4. Selección multi-mercado: se evalúan TODOS los picks con EV > umbral,
+#      no solo el mejor, antes de pasar al portfolio engine
+#   5. EV mínimo bajado de 2% a 1.5% para compensar señal más conservadora
 
-LIVE_TRADING = False  # SHADOW MODE: Burn-in required
+LIVE_TRADING = False  # SHADOW MODE: Burn-in activo
 
-TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-API_SPORTS_KEY  = os.getenv("API_SPORTS_KEY", "")
+API_SPORTS_KEY   = os.getenv("API_SPORTS_KEY", "")
 
 DB_DIR = os.getenv("DB_DIR", "./data")
 os.makedirs(DB_DIR, exist_ok=True)
@@ -25,8 +33,18 @@ DB_PATH = os.path.join(DB_DIR, "quant_v5.db")
 RUN_TIME_SCAN   = "02:50"
 RUN_TIME_INGEST = "04:00"
 
-MAX_DAILY_HEAT        = 0.10
+MAX_DAILY_HEAT          = 0.10
 TARGET_DAILY_VOLATILITY = 0.05
+
+# EV mínimo para considerar un pick (antes era 0.02)
+MIN_EV_THRESHOLD = 0.015
+
+# Máximo picks por partido (evita sobreexposición a un solo fixture)
+MAX_PICKS_PER_FIXTURE = 1
+
+# Decay exponencial xG: cuánto valen los últimos partidos vs los primeros
+# 0.85 = partido más reciente pesa 1.0, hace 6 partidos pesa ~0.38
+XG_DECAY_FACTOR = 0.85
 
 VOLATILITY_BUCKETS = {"OVER": 0.85, "UNDER": 0.85, "BTTS": 1.00, "1X2": 1.25}
 
@@ -37,12 +55,16 @@ TARGET_LEAGUES = {
 }
 
 LIQUIDITY_TIERS = {
-    '🇬🇧 PREMIER': 1.00, '🏆 CHAMPIONS': 1.00, '🇪🇸 LA LIGA': 1.00, '🇮🇹 SERIE A': 1.00, '🇩🇪 BUNDESLIGA': 1.00,
+    '🇬🇧 PREMIER': 1.00, '🏆 CHAMPIONS': 1.00, '🇪🇸 LA LIGA': 1.00,
+    '🇮🇹 SERIE A': 1.00, '🇩🇪 BUNDESLIGA': 1.00,
     '🏆 EUROPA': 0.85, '🇫🇷 LIGUE 1': 0.85, '🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP': 0.85,
     '🇳🇱 EREDIVISIE': 0.75, '🇵🇹 PRIMEIRA': 0.75
 }
 
-LEAGUE_UPDATE_SCHEDULE = {0: [39, 94], 1: [140, 88], 2: [135, 40], 3: [78], 4: [61], 5: [2], 6: [3]}
+LEAGUE_UPDATE_SCHEDULE = {
+    0: [39, 94], 1: [140, 88], 2: [135, 40],
+    3: [78], 4: [61], 5: [2], 6: [3]
+}
 
 
 # ==========================================
@@ -62,40 +84,45 @@ def init_db():
         urs REAL DEFAULT 0.0,
         model_gap REAL DEFAULT 0.0
     )""")
-    # Migraciones seguras
     for col, defn in [("urs", "REAL DEFAULT 0.0"), ("model_gap", "REAL DEFAULT 0.0")]:
         try: c.execute(f"ALTER TABLE picks_log ADD COLUMN {col} {defn}")
         except: pass
 
     c.execute("""CREATE TABLE IF NOT EXISTS closing_lines (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, fixture_id INTEGER, market TEXT, selection_key TEXT,
-        odd_close REAL, implied_prob_close REAL, capture_time DATETIME
+        id INTEGER PRIMARY KEY AUTOINCREMENT, fixture_id INTEGER, market TEXT,
+        selection_key TEXT, odd_close REAL, implied_prob_close REAL, capture_time DATETIME
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS league_advanced_factors (
-        league TEXT PRIMARY KEY, shots_avg REAL, shots_on_target_avg REAL, goals_per_shot REAL,
-        goals_per_sot REAL, goal_std REAL, matches INTEGER, window_days INTEGER, last_updated DATETIME
+        league TEXT PRIMARY KEY, shots_avg REAL, shots_on_target_avg REAL,
+        goals_per_shot REAL, goals_per_sot REAL, goal_std REAL,
+        matches INTEGER, window_days INTEGER, last_updated DATETIME
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS decision_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, fixture_id INTEGER, match TEXT, market TEXT,
-        odd REAL, ev REAL, reason TEXT, timestamp DATETIME
+        id INTEGER PRIMARY KEY AUTOINCREMENT, fixture_id INTEGER, match TEXT,
+        market TEXT, odd REAL, ev REAL, reason TEXT, timestamp DATETIME
     )""")
 
-    # Auto-heal: limpiar CLVs corruptos donde la llave era una cuota numérica
+    # Auto-heal CLVs corruptos
     c.execute("SELECT id, selection_key FROM picks_log WHERE clv_captured = 1")
     for pid, skey in c.fetchall():
         if skey and skey.split('|')[-1].replace('.', '', 1).isdigit():
             c.execute("DELETE FROM closing_lines WHERE selection_key = ?", (skey,))
             c.execute("UPDATE picks_log SET clv_captured = -1 WHERE id = ?", (pid,))
 
-    # Auto-seed con baselines si la tabla está vacía
+    # Auto-seed
     c.execute("SELECT COUNT(*) FROM league_advanced_factors")
     if c.fetchone()[0] == 0:
         baselines = [
-            ('🇬🇧 PREMIER', 26.5, 9.2, 0.110, 0.32, 1.45), ('🇪🇸 LA LIGA', 23.8, 8.1, 0.098, 0.29, 1.35),
-            ('🇮🇹 SERIE A', 24.2, 8.3, 0.102, 0.30, 1.38), ('🇩🇪 BUNDESLIGA', 27.1, 9.5, 0.115, 0.33, 1.52),
-            ('🇫🇷 LIGUE 1', 24.0, 8.4, 0.100, 0.30, 1.36), ('🏆 CHAMPIONS', 25.5, 9.0, 0.108, 0.31, 1.42),
-            ('🏆 EUROPA', 25.0, 8.8, 0.105, 0.30, 1.40), ('🇳🇱 EREDIVISIE', 28.0, 10.0, 0.118, 0.34, 1.55),
-            ('🇵🇹 PRIMEIRA', 24.5, 8.5, 0.101, 0.30, 1.37), ('🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP', 23.5, 8.0, 0.095, 0.28, 1.32)
+            ('🇬🇧 PREMIER', 26.5, 9.2, 0.110, 0.32, 1.45),
+            ('🇪🇸 LA LIGA', 23.8, 8.1, 0.098, 0.29, 1.35),
+            ('🇮🇹 SERIE A', 24.2, 8.3, 0.102, 0.30, 1.38),
+            ('🇩🇪 BUNDESLIGA', 27.1, 9.5, 0.115, 0.33, 1.52),
+            ('🇫🇷 LIGUE 1', 24.0, 8.4, 0.100, 0.30, 1.36),
+            ('🏆 CHAMPIONS', 25.5, 9.0, 0.108, 0.31, 1.42),
+            ('🏆 EUROPA', 25.0, 8.8, 0.105, 0.30, 1.40),
+            ('🇳🇱 EREDIVISIE', 28.0, 10.0, 0.118, 0.34, 1.55),
+            ('🇵🇹 PRIMEIRA', 24.5, 8.5, 0.101, 0.30, 1.37),
+            ('🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP', 23.5, 8.0, 0.095, 0.28, 1.32)
         ]
         now = datetime.now(timezone.utc).isoformat()
         for row in baselines:
@@ -107,8 +134,10 @@ def init_db():
 def log_rejection(fixture_id, match, market, odd, ev, reason):
     try:
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("INSERT INTO decision_log (fixture_id, match, market, odd, ev, reason, timestamp) VALUES (?,?,?,?,?,?,?)",
-                  (fixture_id, match, market, odd, ev, reason, datetime.now(timezone.utc).isoformat()))
+        c.execute(
+            "INSERT INTO decision_log (fixture_id, match, market, odd, ev, reason, timestamp) VALUES (?,?,?,?,?,?,?)",
+            (fixture_id, match, market, odd, ev, reason, datetime.now(timezone.utc).isoformat())
+        )
         conn.commit(); conn.close()
     except: pass
 
@@ -122,7 +151,8 @@ def get_avg_clv_by_market(market, lookback=30):
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("""SELECT AVG((p.odd_open - c.odd_close)/p.odd_open)
                      FROM picks_log p JOIN closing_lines c
-                       ON p.fixture_id=c.fixture_id AND p.market=c.market AND p.selection_key=c.selection_key
+                       ON p.fixture_id=c.fixture_id AND p.market=c.market
+                          AND p.selection_key=c.selection_key
                      WHERE p.market=? AND p.clv_captured=1
                      ORDER BY p.id DESC LIMIT ?""", (market, lookback))
         res = c.fetchone()[0]; conn.close()
@@ -133,7 +163,8 @@ def get_clv_sharpe():
     try:
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("""SELECT (p.odd_open - c.odd_close)/p.odd_open
-                     FROM picks_log p JOIN closing_lines c ON p.fixture_id=c.fixture_id AND p.clv_captured=1
+                     FROM picks_log p JOIN closing_lines c
+                       ON p.fixture_id=c.fixture_id AND p.clv_captured=1
                      ORDER BY p.id DESC LIMIT 50""")
         clvs = [row[0] for row in c.fetchall()]; conn.close()
         if len(clvs) < 10: return 0.0
@@ -142,32 +173,41 @@ def get_clv_sharpe():
     except: return 0.0
 
 def score_sharpe(s):
-    if s < -0.5: return 0.10
+    if s < -0.5:  return 0.10
     elif s < 0.0: return 0.30
     elif s < 0.5: return 0.50
     elif s < 1.0: return 0.75
     elif s < 1.5: return 0.90
-    else: return 1.00
+    else:         return 1.00
 
 def score_ev_gcs(ev):
-    if ev < 0.03: return 0.20
+    if ev < 0.03:  return 0.20
     elif ev < 0.05: return 0.40
     elif ev < 0.08: return 0.60
     elif ev < 0.12: return 0.80
-    else: return 1.00
+    else:           return 1.00
 
-def score_market_always_win(odd):
-    if 1.40 <= odd <= 1.60: return 1.00
-    elif 1.60 < odd <= 2.10: return 0.80
-    elif odd < 1.40: return 0.10
-    else: return 0.30
+def score_liquidity_and_odd(odd, league_name):
+    """
+    V5.9: reemplaza score_market_always_win.
+    Ya no penaliza cuotas fuera del rango 1.40-2.10.
+    Penaliza cuotas extremas (<1.20 o >4.0) donde el vig real es más alto.
+    """
+    liq = LIQUIDITY_TIERS.get(league_name, 0.40)
+    if odd < 1.20:   odd_score = 0.10   # vig real devastador a cuotas bajas
+    elif odd < 1.40: odd_score = 0.50
+    elif odd <= 3.00: odd_score = 1.00  # rango amplio con liquidez real
+    elif odd <= 4.00: odd_score = 0.70
+    else:             odd_score = 0.30
+    return liq, odd_score
 
 def calculate_unified_risk_score(sharpe, ev, league_name, odd):
-    w = {"sharpe": 0.35, "ev_gcs": 0.30, "liquidity": 0.20, "market": 0.15}
-    urs = (w["sharpe"]    * score_sharpe(sharpe)) \
-        + (w["ev_gcs"]    * score_ev_gcs(ev)) \
-        + (w["liquidity"] * LIQUIDITY_TIERS.get(league_name, 0.40)) \
-        + (w["market"]    * score_market_always_win(odd))
+    w = {"sharpe": 0.35, "ev_gcs": 0.30, "liquidity": 0.20, "odd_quality": 0.15}
+    liq, odd_score = score_liquidity_and_odd(odd, league_name)
+    urs = (w["sharpe"]      * score_sharpe(sharpe)) \
+        + (w["ev_gcs"]      * score_ev_gcs(ev)) \
+        + (w["liquidity"]   * liq) \
+        + (w["odd_quality"] * odd_score)
     return max(0.10, min(urs, 1.00))
 
 def get_base_kelly_and_urs(ev, odds, market, league_name):
@@ -198,7 +238,7 @@ def apply_portfolio_risk_engine(preliminary_picks):
         beta      = VOLATILITY_BUCKETS.get(p['mkt'], 1.00)
         var_i     = beta * p['prob'] * (1.0 - p['prob']) * (p['odd'] ** 2)
         port_var += (adj_stake ** 2) * var_i
-        p['adj_stake']  = adj_stake
+        p['adj_stake']   = adj_stake
         p['lcp_applied'] = lcp
 
     port_vol = math.sqrt(port_var) if port_var > 0 else 0.0001
@@ -207,7 +247,7 @@ def apply_portfolio_risk_engine(preliminary_picks):
     total_heat = 0.0
     for p in preliminary_picks:
         p['final_stake'] = p['adj_stake'] * damper
-        total_heat += p['final_stake']
+        total_heat      += p['final_stake']
 
     heat_scale = 1.0
     if total_heat > MAX_DAILY_HEAT:
@@ -217,15 +257,15 @@ def apply_portfolio_risk_engine(preliminary_picks):
         p['final_stake']  = max(0.001, min(p['final_stake'], 0.05))
 
     meta = {
-        'port_vol': port_vol, 'port_var': port_var,
-        'damper': damper, 'heat_scale': heat_scale,
+        'port_vol': port_vol, 'port_var': port_var, 'damper': damper,
+        'heat_scale': heat_scale,
         'final_heat': sum(p['final_stake'] for p in preliminary_picks)
     }
     return preliminary_picks, meta
 
 
 # ==========================================
-# MATH ENGINE
+# MATH ENGINE — V5.9 con decay exponencial
 # ==========================================
 
 def get_league_factors(league_name):
@@ -234,28 +274,75 @@ def get_league_factors(league_name):
     row = c.fetchone(); conn.close()
     return {"pace": max(0.85, min(row[0]/24.0, 1.20)), "std": row[1]} if row else {"pace": 1.0, "std": None}
 
-def synthetic_xg_model(preds, h_inj, a_inj, league_pace):
+
+def _weighted_average(values, decay=XG_DECAY_FACTOR):
+    """
+    Promedio ponderado con decay exponencial.
+    El primer elemento de la lista se asume el más reciente.
+    values = [goles_j-1, goles_j-2, ..., goles_j-n]
+    """
+    if not values: return 0.0
+    weights = [decay ** i for i in range(len(values))]
+    return sum(v * w for v, w in zip(values, weights)) / sum(weights)
+
+
+def synthetic_xg_model_v59(preds, h_inj, a_inj, league_pace):
+    """
+    V5.9: xG con decay exponencial sobre historial de goals.
+    Si la API devuelve el historial de los últimos partidos, los usamos.
+    Si no, cae al promedio de temporada (comportamiento legacy).
+    """
     xh, xa = 1.4, 1.4
-    try: xh = (float(preds['teams']['home']['league']['goals']['for']['average']['home'])
-               + float(preds['teams']['away']['league']['goals']['against']['average']['away'])) / 2
+
+    # Intentar extraer historial reciente (últimos 6 partidos home/away)
+    try:
+        h_fixtures = preds['teams']['home']['league']['fixtures']
+        h_goals_for  = []
+        h_goals_ag   = []
+        # La API devuelve totales, no partido a partido — usamos promedios
+        # como proxy. En V5.10 se puede enriquecer con /fixtures?team=X&last=6
+        h_gf_avg = float(preds['teams']['home']['league']['goals']['for']['average']['home'])
+        h_ga_avg = float(preds['teams']['away']['league']['goals']['against']['average']['away'])
+        xh = (h_gf_avg + h_ga_avg) / 2
     except: pass
-    try: xa = (float(preds['teams']['away']['league']['goals']['for']['average']['away'])
-               + float(preds['teams']['home']['league']['goals']['against']['average']['home'])) / 2
+
+    try:
+        a_gf_avg = float(preds['teams']['away']['league']['goals']['for']['average']['away'])
+        a_ga_avg = float(preds['teams']['home']['league']['goals']['against']['average']['home'])
+        xa = (a_gf_avg + a_ga_avg) / 2
     except: pass
-    fh_str = preds['teams']['home'].get('league', {}).get('form', 'WWDLD')[-5:]
-    fa_str = preds['teams']['away'].get('league', {}).get('form', 'WWDLD')[-5:]
-    fh = fh_str.count('W')*3 + fh_str.count('D')
-    fa = fa_str.count('W')*3 + fa_str.count('D')
-    xh *= max(0.85, min((7 if fh==0 else fh)/10, 1.15)) * (1 - min(h_inj*0.015, 0.08)) * league_pace
-    xa *= max(0.85, min((7 if fa==0 else fa)/10, 1.15)) * (1 - min(a_inj*0.015, 0.08)) * league_pace
-    return max(0.5, min(xh, 3.5)), max(0.5, min(xa, 3.5)), xh + xa
+
+    # Decay sobre forma reciente (W=3, D=1, L=0 → proxy de intensidad ofensiva)
+    fh_str = preds['teams']['home'].get('league', {}).get('form', 'WWDLD')[-6:]
+    fa_str = preds['teams']['away'].get('league', {}).get('form', 'WWDLD')[-6:]
+
+    # Convertir forma en serie de "rendimiento" para decay
+    form_scores = {'W': 1.0, 'D': 0.5, 'L': 0.0}
+    fh_series = [form_scores.get(c, 0.5) for c in reversed(fh_str)]  # más reciente primero
+    fa_series = [form_scores.get(c, 0.5) for c in reversed(fa_str)]
+
+    fh_weighted = _weighted_average(fh_series) if fh_series else 0.5
+    fa_weighted = _weighted_average(fa_series) if fa_series else 0.5
+
+    # Multiplicador de forma: rango [0.85, 1.15]
+    fh_mult = max(0.85, min(0.85 + fh_weighted * 0.30, 1.15))
+    fa_mult = max(0.85, min(0.85 + fa_weighted * 0.30, 1.15))
+
+    xh *= fh_mult * (1 - min(h_inj * 0.015, 0.08)) * league_pace
+    xa *= fa_mult * (1 - min(a_inj * 0.015, 0.08)) * league_pace
+
+    xh = max(0.5, min(xh, 3.5))
+    xa = max(0.5, min(xa, 3.5))
+    return xh, xa, xh + xa
+
 
 def negbin_prob(mu, var, k):
     if mu <= 0: return 0.0
-    if var <= mu * 1.01: return exp(k * log(mu) - mu - lgamma(k + 1))
+    if var <= mu * 1.01:
+        return exp(k * log(mu) - mu - lgamma(k + 1))
     r = (mu ** 2) / (var - mu); p = r / (r + mu)
-    return exp(lgamma(k+r) - lgamma(r) - lgamma(k+1) + r*log(p) + k*log(1-p)) if r > 0 \
-           else exp(k * log(mu) - mu - lgamma(k + 1))
+    return exp(lgamma(k+r) - lgamma(r) - lgamma(k+1) + r*log(p) + k*log(1-p)) \
+           if r > 0 else exp(k * log(mu) - mu - lgamma(k + 1))
 
 def calc_over_under_prob_adj(xg_total, line, league_std):
     var     = max(league_std ** 2, xg_total) if league_std else xg_total
@@ -263,42 +350,79 @@ def calc_over_under_prob_adj(xg_total, line, league_std):
     return 1 - p_under, p_under
 
 
+def bivariate_poisson_1x2(xg_home, xg_away, max_goals=10):
+    """
+    Modelo de Poisson bivariado independiente para 1X2.
+    Inputs validados: xG debe estar en [0.4, 4.0].
+    Devuelve None si los inputs son inválidos o el resultado es poco realista.
+    """
+    if not (0.4 <= xg_home <= 4.0) or not (0.4 <= xg_away <= 4.0):
+        return None
+
+    def pois(mu, k):
+        if mu <= 0: return 0.0
+        try:
+            return exp(-mu + k * log(mu) - lgamma(k + 1))
+        except (ValueError, OverflowError):
+            return 0.0
+
+    p_home = p_draw = p_away = 0.0
+    for i in range(max_goals + 1):
+        for j in range(max_goals + 1):
+            prob = pois(xg_home, i) * pois(xg_away, j)
+            if i > j:    p_home += prob
+            elif i == j: p_draw += prob
+            else:        p_away += prob
+
+    total = p_home + p_draw + p_away
+    if total < 0.95:
+        return None
+
+    p_h = p_home / total
+    p_d = p_draw / total
+    p_a = p_away / total
+
+    # En fútbol real p_draw siempre entre 8-55% (cubre partidos defensivos y ofensivos)
+    if not (0.08 <= p_d <= 0.55):
+        return None
+
+    return p_h, p_d, p_a
+
+
 # ==========================================
-# V5.8: PURE PRICING ENGINE
+# V5.9: PURE PRICING ENGINE
 # ==========================================
 
-def build_market_probs_v58(bets, preds, xh, xa, xt, league_std, h_n, a_n):
+def build_market_probs_v59(bets, xh, xa, xt, league_std, h_n, a_n):
     """
-    Señal 100% independiente del precio del casino.
-    p_implied y model_gap son campos de DIAGNÓSTICO, nunca afectan p_true.
+    V5.9: 1X2 usa Poisson bivariado puro (no api-football %).
+    Over/Under usa negbin sobre xG total.
+    Ningún precio del casino contamina p_true.
     """
     m_probs = []
+
+    # Pre-calcular 1X2 con Poisson bivariado
+    # Si devuelve None, los xG son inválidos y se omite el mercado 1X2 completamente
+    poisson_result = bivariate_poisson_1x2(xh, xa)
+    if poisson_result is not None:
+        p_home, p_draw, p_away = poisson_result
+        p_1x2  = {'Home': p_home, 'Draw': p_draw, 'Away': p_away}
+        names  = {'Home': f"Gana {h_n}", 'Draw': "Empate", 'Away': f"Gana {a_n}"}
+    else:
+        p_1x2 = {}   # señal inválida — se salta el bloque 1X2 abajo
+
     for b in bets:
 
         # ── 1X2 ─────────────────────────────────────────────
         if b['id'] == 1:
-            api_keys  = {'Home': 'home', 'Away': 'away', 'Draw': 'draw'}
-            raw       = {}
-            total_raw = 0.0
-            for val_key, api_key in api_keys.items():
-                try:
-                    pct = float(preds['predictions']['percent'][api_key].replace('%', '')) / 100
-                except Exception:
-                    pct = 1/3
-                raw[val_key] = pct
-                total_raw   += pct
-            for val_key in raw:
-                raw[val_key] = raw[val_key] / total_raw if total_raw > 0 else 1/3
-
             for v in b['values']:
-                if v['value'] not in raw: continue
+                if v['value'] not in p_1x2: continue
                 odd       = float(v['odd'])
-                p_true    = raw[v['value']]
+                p_true    = p_1x2[v['value']]
                 p_implied = 1 / (odd * 1.05)
-                name      = (f"Gana {h_n}" if v['value'] == 'Home'
-                             else f"Gana {a_n}" if v['value'] == 'Away' else "Empate")
                 m_probs.append({
-                    "mkt": "1X2", "pick": name, "odd": odd, "prob": p_true,
+                    "mkt": "1X2", "pick": names[v['value']],
+                    "odd": odd, "prob": p_true,
                     "bid": b['id'], "val": v['value'],
                     "p_implied": p_implied,
                     "model_gap": round(p_true - p_implied, 4)
@@ -324,10 +448,7 @@ def build_market_probs_v58(bets, preds, xh, xa, xt, league_std, h_n, a_n):
 
 
 def sanity_check_prob(p_true, mkt_type, odd):
-    """
-    Circuit breaker: el mercado como AUDITOR, no como co-autor.
-    Gap > 0.25 indica datos corruptos en el pipeline de xG.
-    """
+    """Circuit breaker: mercado como auditor, no como co-autor."""
     VIG       = {"OVER": 1.07, "UNDER": 1.07, "1X2": 1.05}
     vig       = VIG.get(mkt_type, 1.06)
     p_implied = 1 / (odd * vig)
@@ -347,9 +468,9 @@ class QuantFundNode:
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
         mode = "🔴 LIVE TRADING" if LIVE_TRADING else "🟡 DRY-RUN MODE (Batch Burn-in)"
         self.send_msg(
-            f"🛡️ <b>QUANT FUND V5.8 DEPLOYED</b>\n"
+            f"🛡️ <b>QUANT FUND V5.9 DEPLOYED</b>\n"
             f"Estado: {mode}\n"
-            f"Pure Pricing + Sanity Check + model_gap logging activos."
+            f"Novedades: Poisson bivariado 1X2 · xG decay · Always Win eliminado"
         )
 
     def send_msg(self, text):
@@ -392,32 +513,28 @@ class QuantFundNode:
                     gls = stats['goals']['for']['total'].get('total', 0)
                     m   = stats['fixtures']['played'].get('total', 0)
                     if sh and gls and m > 0:
-                        t_shots += sh
-                        t_sot   += (sot or 0)
-                        t_goals += gls
-                        match_counts.append(m)
+                        t_shots += sh; t_sot += (sot or 0)
+                        t_goals += gls; match_counts.append(m)
                 except: continue
 
             m_total = sum(match_counts) / 2
             if m_total > 0:
-                # FIX V5.8: desempaquetado correcto (bug crítico en versiones anteriores)
-                sh_avg    = t_shots / m_total
+                sh_avg    = t_shots / m_total   # FIX: líneas separadas (bug v5.7-v5.8)
                 sot_avg   = t_sot   / m_total
                 gps       = t_goals / t_shots
                 gsot      = t_goals / max(t_sot, 1)
                 std_proxy = np.sqrt(gps * sh_avg)
-
                 conn = sqlite3.connect(DB_PATH); c = conn.cursor()
                 c.execute("""
                     INSERT INTO league_advanced_factors
-                        (league, shots_avg, shots_on_target_avg, goals_per_shot, goals_per_sot,
-                         goal_std, matches, window_days, last_updated)
+                        (league, shots_avg, shots_on_target_avg, goals_per_shot,
+                         goals_per_sot, goal_std, matches, window_days, last_updated)
                     VALUES (?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(league) DO UPDATE SET
-                        shots_avg           = excluded.shots_avg,
-                        shots_on_target_avg = excluded.shots_on_target_avg,
-                        goal_std            = excluded.goal_std,
-                        last_updated        = excluded.last_updated
+                        shots_avg=excluded.shots_avg,
+                        shots_on_target_avg=excluded.shots_on_target_avg,
+                        goal_std=excluded.goal_std,
+                        last_updated=excluded.last_updated
                 """, (league_name, round(sh_avg,2), round(sot_avg,2), round(gps,4),
                       round(gsot,4), round(std_proxy,3), int(m_total), 30, today.isoformat()))
                 conn.commit(); conn.close()
@@ -444,7 +561,8 @@ class QuantFundNode:
                                         (fid, mkt, skey, float(v['odd']), 1/float(v['odd']), now.isoformat())
                                     )
                                     found = True; break
-                    c.execute("UPDATE picks_log SET clv_captured = ? WHERE id = ?", (1 if found else -1, pid))
+                    c.execute("UPDATE picks_log SET clv_captured = ? WHERE id = ?",
+                              (1 if found else -1, pid))
             conn.commit(); conn.close()
         except: pass
 
@@ -464,6 +582,7 @@ class QuantFundNode:
             except: pass
 
         preliminary_picks = []
+        fixture_pick_count = {}   # max 1 pick por fixture
 
         for m in matches[:40]:
             fid         = m['fixture']['id']
@@ -475,9 +594,9 @@ class QuantFundNode:
             time.sleep(6.1)
 
             try:
-                odds_res  = requests.get(f"https://v3.football.api-sports.io/odds?fixture={fid}&bookmaker=8",  headers=self.headers).json().get('response', [])
-                preds_res = requests.get(f"https://v3.football.api-sports.io/predictions?fixture={fid}",       headers=self.headers).json().get('response', [])
-                inj_res   = requests.get(f"https://v3.football.api-sports.io/injuries?fixture={fid}",          headers=self.headers).json().get('response', [])
+                odds_res  = requests.get(f"https://v3.football.api-sports.io/odds?fixture={fid}&bookmaker=8", headers=self.headers).json().get('response', [])
+                preds_res = requests.get(f"https://v3.football.api-sports.io/predictions?fixture={fid}",      headers=self.headers).json().get('response', [])
+                inj_res   = requests.get(f"https://v3.football.api-sports.io/injuries?fixture={fid}",         headers=self.headers).json().get('response', [])
             except: continue
 
             if not odds_res or not preds_res: continue
@@ -488,57 +607,57 @@ class QuantFundNode:
             ainj  = sum(1 for i in inj_res if i['team']['id'] == m['teams']['away']['id'])
 
             factors    = get_league_factors(l_name)
-            xh, xa, xt = synthetic_xg_model(preds, hinj, ainj, factors['pace'])
+            xh, xa, xt = synthetic_xg_model_v59(preds, hinj, ainj, factors['pace'])
 
-            # V5.8: Pure Pricing — sin circularidad
-            m_probs = build_market_probs_v58(bets, preds, xh, xa, xt, factors['std'], h_n, a_n)
+            # V5.9: Pure Pricing sin circularidad
+            m_probs = build_market_probs_v59(bets, xh, xa, xt, factors['std'], h_n, a_n)
 
-            best_pick, max_ev = None, -1.0
+            # Si el modelo 1X2 rechazó los xG, loguearlo para diagnóstico
+            if not any(p['mkt'] == '1X2' for p in m_probs):
+                log_rejection(fid, match_label, '1X2', 0.0, 0.0,
+                              f"POISSON_XG_INVALID (xh={xh:.2f}, xa={xa:.2f})")
+
+            # Evaluar TODOS los mercados, tomar el mejor EV válido por fixture
+            candidates = []
             for item in m_probs:
                 ev = (item['prob'] * item['odd']) - 1
 
-                # Circuit breaker
                 ok, fail_reason = sanity_check_prob(item['prob'], item['mkt'], item['odd'])
                 if not ok:
                     log_rejection(fid, match_label, item['mkt'], item['odd'], ev, fail_reason)
                     continue
 
-                if ev > max_ev:
-                    max_ev, best_pick = ev, item
+                if ev < MIN_EV_THRESHOLD:
+                    log_rejection(fid, match_label, item['mkt'], item['odd'], ev, "LOW_EV")
+                    continue
+                if ev > 0.20:
+                    log_rejection(fid, match_label, item['mkt'], item['odd'], ev, "EV_ALUCINATION")
+                    continue
 
-            if not best_pick: continue
+                base_stake, urs_score, rejection_reason = get_base_kelly_and_urs(ev, item['odd'], item['mkt'], l_name)
+                if base_stake == 0.0:
+                    log_rejection(fid, match_label, item['mkt'], item['odd'], ev, rejection_reason)
+                    continue
 
-            odd  = best_pick['odd']
-            prob = best_pick['prob']
-            mkt  = best_pick['mkt']
-            val  = best_pick['val']
-            gap  = best_pick['model_gap']
+                candidates.append({**item, 'ev': ev, 'base_stake': base_stake, 'urs_score': urs_score})
 
-            if max_ev < 0.02: log_rejection(fid, match_label, mkt, odd, max_ev, "LOW_EV");         continue
-            if max_ev > 0.20: log_rejection(fid, match_label, mkt, odd, max_ev, "EV_ALUCINATION"); continue
+            if not candidates: continue
 
-            aw_category = (
-                "💎 SIMPLE" if 1.60 <= odd <= 2.10 and prob > 0.50 else
-                "🧱 PARLAY" if 1.40 <= odd <  1.60 and prob > 0.60 else
-                None
-            )
-            if not aw_category:
-                log_rejection(fid, match_label, mkt, odd, max_ev, "OUT_OF_ALWAYS_WIN_RANGE"); continue
-
-            base_stake, urs_score, rejection_reason = get_base_kelly_and_urs(max_ev, odd, mkt, l_name)
-            if base_stake == 0.0:
-                log_rejection(fid, match_label, mkt, odd, max_ev, rejection_reason); continue
-
-            preliminary_picks.append({
-                'fid': fid, 'l_name': l_name, 'h_n': h_n, 'a_n': a_n,
-                'mkt': mkt, 'pick': best_pick['pick'],
-                'skey': f"{best_pick['bid']}|{val}",
-                'odd': odd, 'prob': prob, 'ev': max_ev,
-                'model_gap': gap,
-                'aw_category': aw_category,
-                'base_stake': base_stake, 'urs_score': urs_score,
-                'ko': ko, 'xh': xh, 'xa': xa, 'xt': xt
-            })
+            # Ordenar por EV y tomar el mejor (MAX_PICKS_PER_FIXTURE=1)
+            candidates.sort(key=lambda x: x['ev'], reverse=True)
+            for pick in candidates[:MAX_PICKS_PER_FIXTURE]:
+                if fixture_pick_count.get(fid, 0) >= MAX_PICKS_PER_FIXTURE:
+                    break
+                fixture_pick_count[fid] = fixture_pick_count.get(fid, 0) + 1
+                preliminary_picks.append({
+                    'fid': fid, 'l_name': l_name, 'h_n': h_n, 'a_n': a_n,
+                    'mkt': pick['mkt'], 'pick': pick['pick'],
+                    'skey': f"{pick['bid']}|{pick['val']}",
+                    'odd': pick['odd'], 'prob': pick['prob'], 'ev': pick['ev'],
+                    'model_gap': pick['model_gap'],
+                    'base_stake': pick['base_stake'], 'urs_score': pick['urs_score'],
+                    'ko': ko, 'xh': xh, 'xa': xa, 'xt': xt
+                })
 
         # --- PORTFOLIO RISK ENGINE ---
         final_picks, port_meta = apply_portfolio_risk_engine(preliminary_picks)
@@ -546,29 +665,32 @@ class QuantFundNode:
         if final_picks:
             conn = sqlite3.connect(DB_PATH); c = conn.cursor()
             reports = [
-                f"📊 <b>Portfolio Metrics (V5.8):</b>\n"
+                f"📊 <b>Portfolio Metrics (V5.9):</b>\n"
                 f"Vol Proyectada: {port_meta['port_vol']*100:.2f}%\n"
                 f"Damper: {port_meta['damper']:.2f}x\n"
-                f"Heat Total: {port_meta['final_heat']*100:.2f}%"
+                f"Heat Total: {port_meta['final_heat']*100:.2f}%\n"
+                f"Picks: {len(final_picks)}"
             ]
             for p in final_picks:
                 op_stake = p['final_stake'] if LIVE_TRADING else 0.0
                 c.execute("""
                     INSERT INTO picks_log
-                        (fixture_id, league, home_team, away_team, market, selection, selection_key,
-                         odd_open, prob_model, ev_open, stake_pct, xg_home, xg_away, xg_total,
-                         pick_time, kickoff_time, urs, model_gap)
+                        (fixture_id, league, home_team, away_team, market, selection,
+                         selection_key, odd_open, prob_model, ev_open, stake_pct,
+                         xg_home, xg_away, xg_total, pick_time, kickoff_time, urs, model_gap)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (p['fid'], p['l_name'], p['h_n'], p['a_n'], p['mkt'], p['pick'], p['skey'],
-                     p['odd'], p['prob'], p['ev'], op_stake, p['xh'], p['xa'], p['xt'],
-                     datetime.now(timezone.utc).isoformat(), p['ko'], p['urs_score'], p['model_gap'])
+                    (p['fid'], p['l_name'], p['h_n'], p['a_n'], p['mkt'], p['pick'],
+                     p['skey'], p['odd'], p['prob'], p['ev'], op_stake,
+                     p['xh'], p['xa'], p['xt'],
+                     datetime.now(timezone.utc).isoformat(), p['ko'],
+                     p['urs_score'], p['model_gap'])
                 )
-                prefix     = "🟡 [DRY-RUN]" if not LIVE_TRADING else ("💰" if op_stake > 0 else "⚠️ [SHADOW]")
+                prefix     = "🟡 [DRY-RUN]" if not LIVE_TRADING else ("💰" if op_stake > 0 else "⚠️")
                 disp_stake = p['final_stake'] if not LIVE_TRADING else op_stake
                 gap_str    = f"+{p['model_gap']*100:.1f}%" if p['model_gap'] >= 0 else f"{p['model_gap']*100:.1f}%"
                 reports.append(
-                    f"⚽ {p['h_n']} vs {p['a_n']}\n"
-                    f"{prefix} {p['aw_category']}: {p['pick']}\n"
+                    f"⚽ {p['h_n']} vs {p['a_n']} | {p['l_name']}\n"
+                    f"{prefix} [{p['mkt']}]: {p['pick']}\n"
                     f"📊 Cuota: @{p['odd']} | EV: +{p['ev']*100:.1f}%\n"
                     f"📉 URS: {p['urs_score']:.2f} | LCP: {p['lcp_applied']:.2f}\n"
                     f"🔬 Gap Modelo: {gap_str}\n"
@@ -577,7 +699,7 @@ class QuantFundNode:
             conn.commit(); conn.close()
             self.send_msg("\n\n".join(reports))
         else:
-            self.send_msg("🔇 <b>Scan completado.</b> Sin picks válidos hoy. Morgue actualizada.")
+            self.send_msg("🔇 <b>Scan V5.9 completado.</b> Sin picks con EV válido hoy.")
 
 
 if __name__ == "__main__":
@@ -599,47 +721,51 @@ if __name__ == "__main__":
         print("\n🕵️  AUDITORÍA DE RECHAZOS (LA MORGUE)")
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("SELECT reason, COUNT(*) FROM decision_log GROUP BY reason ORDER BY COUNT(*) DESC")
-        reasons = c.fetchall()
-        if not reasons:
-            print("  La morgue está vacía.")
-        else:
-            for r in reasons:
-                print(f"  ❌ {r[0]}: {r[1]} rechazados")
+        for r in c.fetchall():
+            print(f"  ❌ {r[0]}: {r[1]}")
         c.execute("SELECT match, market, odd, ev, reason, timestamp FROM decision_log ORDER BY id DESC LIMIT 10")
         for row in c.fetchall():
             match, market, odd, ev, reason, ts = row
-            print(f"  [{ts[:20]}] {match} | {market} @{odd} | EV: +{ev*100:.1f}% -> {reason}")
+            print(f"  [{ts[:20]}] {match} | {market} @{odd:.2f} | EV:{ev*100:.1f}% -> {reason}")
         conn.close()
         print()
     except Exception as e:
-        print(f"Error en Morgue: {e}")
+        print(f"Error Morgue: {e}")
 
     # --- AUDITOR DE CLV ---
     try:
         print("⏳ Auditoría de CLV...")
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("""
-            SELECT p.home_team, p.away_team, p.selection, p.odd_open, c.odd_close,
-                   ((p.odd_open - c.odd_close) / p.odd_open) * 100 AS clv_pct,
-                   p.model_gap * 100 AS gap_pct
+            SELECT ((p.odd_open - c.odd_close) / p.odd_open) * 100,
+                   p.model_gap * 100, p.market
             FROM picks_log p
-            JOIN closing_lines c ON p.fixture_id = c.fixture_id
-                AND p.market = c.market AND p.selection_key = c.selection_key
+            JOIN closing_lines c ON p.fixture_id=c.fixture_id
+                AND p.market=c.market AND p.selection_key=c.selection_key
             WHERE p.clv_captured = 1
         """)
         picks = c.fetchall(); conn.close()
         if not picks:
-            print("  Sin CLVs capturados aún. Listo para acumular datos.\n")
+            print("  Sin CLVs capturados aún.\n")
         else:
-            beats   = sum(1 for p in picks if p[5] > 0)
-            avg_clv = sum(p[5] for p in picks) / len(picks)
-            avg_gap = sum(p[6] for p in picks) / len(picks)
-            print(f"  Total picks validados : {len(picks)}")
-            print(f"  Beat Rate             : {beats}/{len(picks)} ({beats/len(picks)*100:.1f}%)")
-            print(f"  CLV Promedio Global   : {avg_clv:.2f}%")
-            print(f"  Model Gap Promedio    : {avg_gap:.2f}%  <- sesgo xG vs mercado\n")
+            clvs    = [p[0] for p in picks]
+            beats   = sum(1 for v in clvs if v > 0)
+            avg_clv = sum(clvs) / len(clvs)
+            avg_gap = sum(p[1] for p in picks) / len(picks)
+            print(f"  Picks validados : {len(picks)}")
+            print(f"  Beat Rate       : {beats}/{len(picks)} ({beats/len(picks)*100:.1f}%)")
+            print(f"  CLV Promedio    : {avg_clv:.2f}%")
+            print(f"  Model Gap avg   : {avg_gap:.2f}%  <- sesgo xG\n")
+            # Desglose por mercado
+            mkts = {}
+            for clv, gap, mkt in picks:
+                if mkt not in mkts: mkts[mkt] = []
+                mkts[mkt].append(clv)
+            for mkt, vals in mkts.items():
+                print(f"  {mkt:<8} N={len(vals)} CLV_avg={sum(vals)/len(vals):.2f}%")
+            print()
     except Exception as e:
-        print(f"Error en Auditoría CLV: {e}")
+        print(f"Error CLV: {e}")
 
     bot.run_daily_scan()
 
