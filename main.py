@@ -44,7 +44,7 @@ MAX_EV_THRESHOLD        = 0.15   # bajado de 0.20 — EVs > 15% son sospechosos
 MAX_PICKS_PER_FIXTURE   = 1
 XG_DECAY_FACTOR         = 0.85
 
-VOLATILITY_BUCKETS = {"OVER": 0.85, "UNDER": 0.85, "BTTS": 1.00, "1X2": 1.25}
+VOLATILITY_BUCKETS = {"OVER": 0.85, "UNDER": 0.85, "BTTS": 0.90, "1X2": 1.25}
 
 TARGET_LEAGUES = {
     39: '🇬🇧 PREMIER', 140: '🇪🇸 LA LIGA', 135: '🇮🇹 SERIE A',
@@ -387,6 +387,13 @@ def calc_over_under_prob_adj(xg_total, line, league_std):
     return 1 - p_under, p_under
 
 
+def _poisson_pmf(mu, k):
+    """Función de masa de probabilidad de Poisson. Segura contra overflow."""
+    if mu <= 0 or k < 0: return 0.0
+    try: return exp(-mu + k * log(mu) - lgamma(k + 1))
+    except (ValueError, OverflowError): return 0.0
+
+
 def bivariate_poisson_1x2(xg_home, xg_away, max_goals=10):
     """
     Poisson bivariado independiente para 1X2.
@@ -395,15 +402,10 @@ def bivariate_poisson_1x2(xg_home, xg_away, max_goals=10):
     if not (0.4 <= xg_home <= 4.0) or not (0.4 <= xg_away <= 4.0):
         return None
 
-    def pois(mu, k):
-        if mu <= 0: return 0.0
-        try: return exp(-mu + k * log(mu) - lgamma(k + 1))
-        except (ValueError, OverflowError): return 0.0
-
     p_home = p_draw = p_away = 0.0
     for i in range(max_goals + 1):
         for j in range(max_goals + 1):
-            prob = pois(xg_home, i) * pois(xg_away, j)
+            prob = _poisson_pmf(xg_home, i) * _poisson_pmf(xg_away, j)
             if i > j:    p_home += prob
             elif i == j: p_draw += prob
             else:        p_away += prob
@@ -420,13 +422,40 @@ def bivariate_poisson_1x2(xg_home, xg_away, max_goals=10):
     return p_h, p_d, p_a
 
 
+def calc_btts_prob(xg_home, xg_away):
+    """
+    BTTS (Both Teams To Score) usando Poisson independiente.
+
+    P(home scores) = 1 - P(home_goals = 0) = 1 - e^(-xg_home)
+    P(away scores) = 1 - P(away_goals = 0) = 1 - e^(-xg_away)
+    P(BTTS Yes)    = P(home scores) * P(away scores)
+
+    Matemáticamente exacto bajo independencia de Poisson.
+    Solo válido si ambos xG tienen confianza HIGH.
+    """
+    if not (0.4 <= xg_home <= 4.0) or not (0.4 <= xg_away <= 4.0):
+        return None, None
+
+    p_home_scores = 1 - exp(-xg_home)
+    p_away_scores = 1 - exp(-xg_away)
+    p_btts_yes    = p_home_scores * p_away_scores
+    p_btts_no     = 1 - p_btts_yes
+
+    # Sanity: BTTS Yes entre 20-90% para ser realista como señal apostable
+    if not (0.20 <= p_btts_yes <= 0.90):
+        return None, None
+
+    return round(p_btts_yes, 4), round(p_btts_no, 4)
+
+
 # ==========================================
 # V5.10: PURE PRICING ENGINE
 # ==========================================
 
-def build_market_probs_v510(bets, xh, xa, xt, league_std, h_n, a_n):
+def build_market_probs_v510(bets, xh, xa, xt, league_std, h_n, a_n, conf="HIGH"):
     m_probs = []
 
+    # Pre-calcular probabilidades del modelo
     poisson_result = bivariate_poisson_1x2(xh, xa)
     if poisson_result is not None:
         p_home, p_draw, p_away = poisson_result
@@ -434,6 +463,11 @@ def build_market_probs_v510(bets, xh, xa, xt, league_std, h_n, a_n):
         names  = {'Home': f"Gana {h_n}", 'Draw': "Empate", 'Away': f"Gana {a_n}"}
     else:
         p_1x2 = {}
+
+    # BTTS solo con confianza HIGH — necesita xG confiables para ambos equipos
+    p_btts_yes, p_btts_no = None, None
+    if conf == "HIGH":
+        p_btts_yes, p_btts_no = calc_btts_prob(xh, xa)
 
     for b in bets:
 
@@ -468,12 +502,28 @@ def build_market_probs_v510(bets, xh, xa, xt, league_std, h_n, a_n):
                     "p_implied": p_implied,
                     "model_gap": round(p_true - p_implied, 4)
                 })
+
+        # ── BTTS (Both Teams To Score) — bet ID 8 en api-football ──
+        elif b['id'] == 8 and p_btts_yes is not None:
+            for v in b['values']:
+                if v['value'] not in ('Yes', 'No'): continue
+                p_true    = p_btts_yes if v['value'] == 'Yes' else p_btts_no
+                odd       = float(v['odd'])
+                p_implied = 1 / (odd * 1.06)
+                m_probs.append({
+                    "mkt": "BTTS", "pick": f"Ambos Marcan: {v['value']}",
+                    "odd": odd, "prob": p_true,
+                    "bid": b['id'], "val": v['value'],
+                    "p_implied": p_implied,
+                    "model_gap": round(p_true - p_implied, 4)
+                })
+
     return m_probs
 
 
 def sanity_check_prob(p_true, mkt_type, odd):
     """Circuit breaker: mercado como auditor, no como co-autor."""
-    VIG       = {"OVER": 1.07, "UNDER": 1.07, "1X2": 1.05}
+    VIG       = {"OVER": 1.07, "UNDER": 1.07, "1X2": 1.05, "BTTS": 1.06}
     vig       = VIG.get(mkt_type, 1.06)
     p_implied = 1 / (odd * vig)
     gap       = abs(p_true - p_implied)
@@ -494,7 +544,8 @@ class QuantFundNode:
         self.send_msg(
             f"🛡️ <b>QUANT FUND V5.10 DEPLOYED</b>\n"
             f"Estado: {mode}\n"
-            f"Fix: detección xG default · EV máx 15% · confianza de datos"
+            f"Mercados: 1X2 · Over/Under · BTTS\n"
+            f"Fix: xG default detection · EV máx 15% · confianza de datos"
         )
 
     def send_msg(self, text):
@@ -644,7 +695,7 @@ class QuantFundNode:
             if conf == "LOW":
                 log_rejection(fid, match_label, '1X2', 0.0, 0.0, "XG_LOW_CONFIDENCE_SKIP_1X2")
 
-            m_probs = build_market_probs_v510(bets, xh, xa, xt, factors['std'], h_n, a_n)
+            m_probs = build_market_probs_v510(bets, xh, xa, xt, factors['std'], h_n, a_n, conf=conf)
 
             # Si confianza baja, filtrar 1X2 de los candidatos
             if conf == "LOW":
