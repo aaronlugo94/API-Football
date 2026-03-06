@@ -146,12 +146,20 @@ def log_rejection(fixture_id, match, market, odd, ev, reason):
 def get_avg_clv_by_market(market, lookback=30):
     try:
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("""SELECT AVG((p.odd_open - c.odd_close)/p.odd_open)
-                     FROM picks_log p JOIN closing_lines c
-                       ON p.fixture_id=c.fixture_id AND p.market=c.market
-                          AND p.selection_key=c.selection_key
-                     WHERE p.market=? AND p.clv_captured=1
-                     ORDER BY p.id DESC LIMIT ?""", (market, lookback))
+        if market:
+            c.execute("""SELECT AVG((p.odd_open - c.odd_close)/p.odd_open)
+                         FROM picks_log p JOIN closing_lines c
+                           ON p.fixture_id=c.fixture_id AND p.market=c.market
+                              AND p.selection_key=c.selection_key
+                         WHERE p.market=? AND p.clv_captured=1
+                         ORDER BY p.id DESC LIMIT ?""", (market, lookback))
+        else:
+            c.execute("""SELECT AVG((p.odd_open - c.odd_close)/p.odd_open)
+                         FROM picks_log p JOIN closing_lines c
+                           ON p.fixture_id=c.fixture_id AND p.market=c.market
+                              AND p.selection_key=c.selection_key
+                         WHERE p.clv_captured=1
+                         ORDER BY p.id DESC LIMIT ?""", (lookback,))
         res = c.fetchone()[0]; conn.close()
         return float(res) if res else 0.0
     except: return 0.0
@@ -203,10 +211,16 @@ def calculate_unified_risk_score(sharpe, ev, league_name, odd):
     return max(0.10, min(urs, 1.00))
 
 def get_base_kelly_and_urs(ev, odds, market, league_name):
-    avg_clv = get_avg_clv_by_market(market)
-    if avg_clv < -0.015: return 0.0, 0.0, "KILL_SWITCH_ACTIVE"
+    # Kill-switch granular por mercado
+    avg_clv_market = get_avg_clv_by_market(market)
+    avg_clv_global = get_avg_clv_by_market(None)  # global
+    if avg_clv_market < -0.015:
+        return 0.0, 0.0, f"KILL_SWITCH_{market}"
+    if avg_clv_global < -0.025:
+        return 0.0, 0.0, "KILL_SWITCH_GLOBAL"
+    # FIX v5.11: max(0.0) en lugar de max(0.001) — respetar Kelly cuando hay poca convicción
     base_kelly = max(0.0, min(ev / (odds - 1), 0.05))
-    if -0.015 <= avg_clv < 0.005: base_kelly *= 0.25
+    if -0.015 <= avg_clv_market < 0.005: base_kelly *= 0.25
     urs = calculate_unified_risk_score(get_clv_sharpe(), ev, league_name, odds)
     return base_kelly * urs, urs, None
 
@@ -575,10 +589,9 @@ class QuantFundNode:
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
         mode = "🔴 LIVE TRADING" if LIVE_TRADING else "🟡 DRY-RUN MODE (Batch Burn-in)"
         self.send_msg(
-            f"🛡️ <b>QUANT FUND V5.10 DEPLOYED</b>\n"
+            f"🛡️ <b>QUANT FUND V5.11 DEPLOYED</b>\n"
             f"Estado: {mode}\n"
-            f"Mercados: 1X2 · Over/Under · BTTS\n"
-            f"Fix: xG default · xG vs O/U market · EV máx 15%"
+            f"Fix: selección ev×urs · kill-switch granular · anti-duplicados CLV"
         )
 
     def send_msg(self, text):
@@ -664,10 +677,16 @@ class QuantFundNode:
                         for b in res['response'][0]['bookmakers'][0]['bets']:
                             for v in b['values']:
                                 if f"{b['id']}|{v['value']}" == skey:
+                                    # FIX v5.11: verificar duplicado antes de INSERT
                                     c.execute(
-                                        "INSERT INTO closing_lines (fixture_id, market, selection_key, odd_close, implied_prob_close, capture_time) VALUES (?,?,?,?,?,?)",
-                                        (fid, mkt, skey, float(v['odd']), 1/float(v['odd']), now.isoformat())
+                                        "SELECT COUNT(*) FROM closing_lines WHERE fixture_id=? AND market=? AND selection_key=?",
+                                        (fid, mkt, skey)
                                     )
+                                    if c.fetchone()[0] == 0:
+                                        c.execute(
+                                            "INSERT INTO closing_lines (fixture_id, market, selection_key, odd_close, implied_prob_close, capture_time) VALUES (?,?,?,?,?,?)",
+                                            (fid, mkt, skey, float(v['odd']), 1/float(v['odd']), now.isoformat())
+                                        )
                                     found = True; break
                     c.execute("UPDATE picks_log SET clv_captured = ? WHERE id = ?",
                               (1 if found else -1, pid))
@@ -765,7 +784,9 @@ class QuantFundNode:
 
             if not candidates: continue
 
-            candidates.sort(key=lambda x: x['ev'], reverse=True)
+            # FIX v5.11: ordenar por ev*urs (valor ajustado al riesgo)
+            # El URS existe para ser criterio de selección — ignorarlo aquí lo anulaba
+            candidates.sort(key=lambda x: x['ev'] * x['urs_score'], reverse=True)
             for pick in candidates[:MAX_PICKS_PER_FIXTURE]:
                 if fixture_pick_count.get(fid, 0) >= MAX_PICKS_PER_FIXTURE:
                     break
@@ -782,6 +803,9 @@ class QuantFundNode:
 
         # --- PORTFOLIO RISK ENGINE ---
         final_picks, port_meta = apply_portfolio_risk_engine(preliminary_picks)
+
+        # FIX v5.11: filtrar picks con stake tan baja que no tiene sentido reportar
+        final_picks = [p for p in final_picks if p.get('final_stake', 0) >= 0.005]
 
         if final_picks:
             conn = sqlite3.connect(DB_PATH); c = conn.cursor()
