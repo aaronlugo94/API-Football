@@ -34,7 +34,7 @@ DB_DIR = os.getenv("DB_DIR", "./data")
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "quant_v5.db")
 
-RUN_TIME_SCAN   = "02:50"
+RUN_TIME_SCAN   = "09:00"   # D-1: cuotas líquidas, mercado abierto
 RUN_TIME_INGEST = "04:00"
 
 MAX_DAILY_HEAT          = 0.10
@@ -574,7 +574,8 @@ def sanity_check_prob(p_true, mkt_type, odd):
     vig       = VIG.get(mkt_type, 1.06)
     p_implied = 1 / (odd * vig)
     gap       = abs(p_true - p_implied)
-    if gap > 0.25:
+    # FIX v5.12: gap reducido 0.25→0.18 — gap de 0.25 indica modelo mal calibrado
+    if gap > 0.18:
         return False, f"XG_SANITY_FAIL (gap={gap:.2f}, p_model={p_true:.2f}, p_impl={p_implied:.2f})"
     return True, None
 
@@ -589,9 +590,9 @@ class QuantFundNode:
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
         mode = "🔴 LIVE TRADING" if LIVE_TRADING else "🟡 DRY-RUN MODE (Batch Burn-in)"
         self.send_msg(
-            f"🛡️ <b>QUANT FUND V5.11 DEPLOYED</b>\n"
+            f"🛡️ <b>QUANT FUND V5.12 DEPLOYED</b>\n"
             f"Estado: {mode}\n"
-            f"Fix: selección ev×urs · kill-switch granular · anti-duplicados CLV"
+            f"Fix: scan 09:00 D-1 · filtro 48h · sanity 0.18 · last6 enriquecido · anti-duplicado fixture"
         )
 
     def send_msg(self, text):
@@ -694,10 +695,13 @@ class QuantFundNode:
         except: pass
 
     def run_daily_scan(self):
-        today    = datetime.now().strftime("%Y-%m-%d")
-        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        matches  = []
-        for d in [today, tomorrow]:
+        # V5.12: scan a las 09:00 UTC del día anterior (D-1)
+        # Busca partidos de hoy, mañana y pasado para capturar cuotas líquidas
+        # con 24-48h de antelación. Filtra partidos a más de 48h (cuotas inmaduras).
+        now_utc   = datetime.now(timezone.utc)
+        matches   = []
+        for days_ahead in [0, 1, 2]:
+            d = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
             try:
                 matches.extend([
                     f for f in requests.get(
@@ -708,8 +712,20 @@ class QuantFundNode:
                 ])
             except: pass
 
+        # FIX v5.12: filtrar partidos a más de 48h — cuotas aún inmaduras
+        def hours_away(m):
+            try:
+                ko = datetime.fromisoformat(m['fixture']['date'].replace('Z', '+00:00'))
+                return (ko - now_utc).total_seconds() / 3600
+            except: return 999
+
+        matches = [m for m in matches if hours_away(m) <= 48]
+        # Ordenar por proximidad — mercados más maduros primero
+        matches.sort(key=hours_away)
+
         preliminary_picks  = []
         fixture_pick_count = {}
+        last6_budget       = 20  # máximo 20 requests extra para enriquecer xG con last6
 
         # FIX v5.12: cargar fixtures ya procesados hoy para evitar duplicados entre sesiones
         already_picked_today = set()
@@ -809,6 +825,84 @@ class QuantFundNode:
 
             if not candidates: continue
 
+            # FIX v5.12: enriquecer xG con last6 para partidos con candidatos prometedores
+            # Budget: máximo 20 requests extra por scan (10 partidos × 2 llamadas)
+            # Solo si hay requests disponibles y el candidato top tiene EV > 5%
+            best_ev = max(c['ev'] for c in candidates)
+            xg_enriched = False
+            if best_ev >= 0.05 and last6_budget > 0:
+                h_id = m['teams']['home']['id']
+                a_id = m['teams']['away']['id']
+                try:
+                    # last6 local
+                    r_h = requests.get(
+                        "https://v3.football.api-sports.io/fixtures",
+                        headers=self.headers,
+                        params={"team": h_id, "league": api_league_id,
+                                "season": 2025, "last": 6},
+                        timeout=12
+                    ).json().get('response', [])
+                    time.sleep(1.5)
+                    r_a = requests.get(
+                        "https://v3.football.api-sports.io/fixtures",
+                        headers=self.headers,
+                        params={"team": a_id, "league": api_league_id,
+                                "season": 2025, "last": 6},
+                        timeout=12
+                    ).json().get('response', [])
+                    last6_budget -= 2
+
+                    def _extract_gf_ga(fixtures, team_id):
+                        gf, ga = [], []
+                        for fx in fixtures:
+                            hid = fx['teams']['home']['id']
+                            hg  = fx['goals']['home']
+                            ag  = fx['goals']['away']
+                            if hg is None or ag is None: continue
+                            if hid == team_id: gf.append(hg); ga.append(ag)
+                            else: gf.append(ag); ga.append(hg)
+                        return gf, ga
+
+                    def _wavg(vals, decay=0.85):
+                        if not vals: return 1.2
+                        w = [decay**i for i in range(len(vals))]
+                        return sum(v*wi for v, wi in zip(vals, w)) / sum(w)
+
+                    hgf, hga = _extract_gf_ga(r_h, h_id)
+                    agf, aga = _extract_gf_ga(r_a, a_id)
+
+                    if len(hgf) >= 3 and len(agf) >= 3:
+                        xh_new = max(0.6, min((_wavg(hgf) + _wavg(aga)) / 2 * factors['pace'], 3.5))
+                        xa_new = max(0.6, min((_wavg(agf) + _wavg(hga)) / 2 * factors['pace'], 3.5))
+                        xt_new = xh_new + xa_new
+
+                        # Solo actualizar si el nuevo xG pasa la validación
+                        ok_new, _ = validate_xg_consistency(xh_new, xa_new, bets)
+                        if ok_new:
+                            xh, xa, xt = xh_new, xa_new, xt_new
+                            conf = "HIGH"
+                            xg_enriched = True
+                            # Recalcular probabilidades con xG enriquecido
+                            m_probs_new = build_market_probs_v510(
+                                bets, xh, xa, xt, factors['std'], h_n, a_n, conf=conf
+                            )
+                            # Revalidar candidatos con nuevo xG
+                            candidates = []
+                            for item in m_probs_new:
+                                ev2 = (item['prob'] * item['odd']) - 1
+                                ok2, _ = sanity_check_prob(item['prob'], item['mkt'], item['odd'])
+                                if not ok2 or ev2 < MIN_EV_THRESHOLD or ev2 > MAX_EV_THRESHOLD:
+                                    continue
+                                st2, urs2, rej2 = get_base_kelly_and_urs(
+                                    ev2, item['odd'], item['mkt'], l_name
+                                )
+                                if st2 == 0.0: continue
+                                candidates.append({**item, 'ev': ev2,
+                                                   'base_stake': st2, 'urs_score': urs2})
+                except: pass
+
+            if not candidates: continue
+
             # FIX v5.11: ordenar por ev*urs (valor ajustado al riesgo)
             # El URS existe para ser criterio de selección — ignorarlo aquí lo anulaba
             candidates.sort(key=lambda x: x['ev'] * x['urs_score'], reverse=True)
@@ -823,7 +917,8 @@ class QuantFundNode:
                     'odd': pick['odd'], 'prob': pick['prob'], 'ev': pick['ev'],
                     'model_gap': pick['model_gap'], 'conf': conf,
                     'base_stake': pick['base_stake'], 'urs_score': pick['urs_score'],
-                    'ko': ko, 'xh': xh, 'xa': xa, 'xt': xt
+                    'ko': ko, 'xh': xh, 'xa': xa, 'xt': xt,
+                    'xg_enriched': xg_enriched
                 })
 
         # --- PORTFOLIO RISK ENGINE ---
@@ -858,7 +953,7 @@ class QuantFundNode:
                 prefix     = "🟡 [DRY-RUN]" if not LIVE_TRADING else ("💰" if op_stake > 0 else "⚠️")
                 disp_stake = p['final_stake'] if not LIVE_TRADING else op_stake
                 gap_str    = f"+{p['model_gap']*100:.1f}%" if p['model_gap'] >= 0 else f"{p['model_gap']*100:.1f}%"
-                conf_icon  = "✅" if p['conf'] == "HIGH" else "⚠️"
+                conf_icon  = "✅ last6" if p.get('xg_enriched') else ("✅" if p['conf'] == "HIGH" else "⚠️")
 
                 reports.append(
                     f"⚽ {p['h_n']} vs {p['a_n']} | {p['l_name']}\n"
