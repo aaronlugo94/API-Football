@@ -711,6 +711,19 @@ class QuantFundNode:
         preliminary_picks  = []
         fixture_pick_count = {}
 
+        # FIX v5.12: cargar fixtures ya procesados hoy para evitar duplicados entre sesiones
+        already_picked_today = set()
+        try:
+            conn_check = sqlite3.connect(DB_PATH); cc = conn_check.cursor()
+            today_str  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            cc.execute(
+                "SELECT fixture_id FROM picks_log WHERE pick_time >= ?",
+                (today_str,)
+            )
+            already_picked_today = {row[0] for row in cc.fetchall()}
+            conn_check.close()
+        except: pass
+
         for m in matches[:40]:
             fid         = m['fixture']['id']
             h_n         = m['teams']['home']['name']
@@ -718,6 +731,18 @@ class QuantFundNode:
             l_name      = TARGET_LEAGUES[m['league']['id']]
             ko          = m['fixture']['date']
             match_label = f"{h_n} vs {a_n}"
+
+            # FIX v5.12: saltar si ya generamos pick para este fixture hoy
+            if fid in already_picked_today:
+                continue
+
+            # FIX v5.12: validar que el partido realmente pertenece a la liga esperada
+            # La API a veces devuelve partidos de ligas incorrectas (ej: Botafogo en Eredivisie)
+            api_league_id = m['league']['id']
+            if api_league_id not in TARGET_LEAGUES:
+                log_rejection(fid, match_label, 'ALL', 0.0, 0.0,
+                              f"LEAGUE_MISMATCH (api_league={api_league_id})")
+                continue
             time.sleep(6.1)
 
             try:
