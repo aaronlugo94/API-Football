@@ -913,6 +913,45 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Error CLV: {e}")
 
+    # --- DIAGNÓSTICO PICKS OVER ---
+    try:
+        print("\n🔬 DIAGNÓSTICO PICKS OVER (todos los registrados):")
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        c.execute("""
+            SELECT
+                p.home_team, p.away_team, p.league,
+                p.odd_open, c.odd_close,
+                ROUND((p.odd_open - c.odd_close) / p.odd_open * 100, 2) as clv_pct,
+                p.xg_home, p.xg_away, p.ev_open, p.model_gap,
+                p.pick_time
+            FROM picks_log p
+            JOIN closing_lines c
+              ON p.fixture_id=c.fixture_id
+              AND p.market=c.market
+              AND p.selection_key=c.selection_key
+            WHERE p.clv_captured=1 AND p.market='OVER'
+            ORDER BY p.pick_time ASC
+        """)
+        over_picks = c.fetchall()
+        if not over_picks:
+            print("  Sin picks OVER con CLV capturado.")
+        else:
+            clvs  = [r[5] for r in over_picks]
+            beats = sum(1 for v in clvs if v > 0)
+            print(f"  N={len(over_picks)} | CLV_avg={sum(clvs)/len(clvs):.2f}% | Beat={beats}/{len(over_picks)}")
+            print()
+            for r in over_picks:
+                h, a, league, odd_o, odd_c, clv, xh, xa, ev, gap, ts = r
+                icon = "✅" if clv > 0 else "❌"
+                date = ts[:10] if ts else "?"
+                print(f"  {icon} [{date}] {h} vs {a} | {league}")
+                print(f"       @{odd_o} → cierre @{odd_c} | CLV:{clv}%")
+                print(f"       xG:{xh:.1f}-{xa:.1f} | EV_open:{ev*100:.1f}% | Gap:{gap*100:.1f}%")
+        conn.close()
+        print()
+    except Exception as e:
+        print(f"Error diagnóstico OVER: {e}")
+
     bot.run_daily_scan()
 
     while True:
