@@ -1009,6 +1009,8 @@ class QuantFundEuropean:
             return False, "error de conexión", "?/?", False, str(e)
 
         # Verificar acceso a ligas por fecha
+        # FIX v5.13: poblar _DATE_FIXTURES_CACHE aquí — run_daily_scan reutiliza
+        # estas respuestas sin hacer nuevos requests para las mismas fechas
         try:
             league_found = set()
             for d_off in range(5):
@@ -1016,7 +1018,9 @@ class QuantFundEuropean:
                 r = requests.get("https://v3.football.api-sports.io/fixtures",
                                  headers=self.headers, params={"date": d}, timeout=10)
                 track_requests(1)
-                for fix in r.json().get("response", []):
+                fixtures = r.json().get("response", [])
+                _DATE_FIXTURES_CACHE[d] = fixtures   # FIX: cache compartida con scan
+                for fix in fixtures:
                     lid = fix["league"]["id"]
                     if lid in TARGET_LEAGUES:
                         league_found.add(lid)
@@ -1322,8 +1326,12 @@ class QuantFundEuropean:
         V5.13: scan a las 09:00 UTC del día anterior.
         xG construido desde historial real por fecha (sin /predictions).
         """
-        now_utc = datetime.now(timezone.utc)
-        clear_date_cache()
+        now_utc  = datetime.now(timezone.utc)
+        # FIX v5.13: no limpiar fechas futuras que _startup_diagnostics ya pre-cargó
+        # Solo eliminar fechas pasadas obsoletas — preserva D+0, D+1, D+2 del diagnóstico
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        for d in [d for d in _DATE_FIXTURES_CACHE if d < today_str]:
+            _DATE_FIXTURES_CACHE.pop(d, None)
 
         # Buscar partidos en los próximos 3 días — filtrar >48h después
         matches_raw = []
@@ -1408,7 +1416,7 @@ class QuantFundEuropean:
                 log_rejection(fid, label, "ALL", 0.0, 0.0, f"LEAGUE_MISMATCH (lid={lid})")
                 continue
 
-            time.sleep(6.1)
+            time.sleep(3.0)   # FIX v5.13: 6.1→3.0s — api-football permite 30 req/min en Free
 
             # Cuotas Bet365
             try:
