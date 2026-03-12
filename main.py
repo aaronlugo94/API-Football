@@ -32,6 +32,7 @@ from math import exp, lgamma, log
 #      - Budget máximo 44 req — nunca superar
 #   6. ARQUITECTURA: startup diagnostics (V6.5)
 #      - Verifica API, plan, requests disponibles y acceso a ligas al arrancar
+#      - Pre-llena _DATE_FIXTURES_CACHE con fechas futuras (reutilizadas por scan)
 #   7. LIGA: Championship eliminado (ID 40)
 #      - Los ~12 req liberados van al warmup de xG cache
 #      - Brasileirao y Liga MX cubiertos por V6.5 en servicio separado
@@ -42,6 +43,9 @@ from math import exp, lgamma, log
 #      - El LCP europeo divide por liga, no solo por total (mejor diversificación)
 #  11. CONSERVADO: todas las correcciones V5.10→V5.12
 #      - Kill-switch granular, anti-duplicado fixture, sanity 0.18, etc.
+#  12. FIX: clear_date_cache en run_daily_scan solo borra fechas pasadas
+#      - Preserva D+0/D+1/D+2 pre-cargadas por _startup_diagnostics
+#      - Ahorra 2-3 req por scan (crítico en Free tier 100/día)
 
 LIVE_TRADING = False
 
@@ -88,7 +92,6 @@ TARGET_LEAGUES = {
     94:  "🇵🇹 PRIMEIRA",
 }
 
-# Liquidez por liga — afecta URS directamente
 LIQUIDITY_TIERS = {
     "🇬🇧 PREMIER":    1.00,
     "🏆 CHAMPIONS":   1.00,
@@ -101,8 +104,6 @@ LIQUIDITY_TIERS = {
     "🇵🇹 PRIMEIRA":   0.75,
 }
 
-# xG std por liga — calibra sobredispersión negbinom
-# Bundesliga es la liga más abierta de Europa (~1.55), Serie A la más cerrada (~1.35)
 XG_STD_BY_LEAGUE = {
     "🇬🇧 PREMIER":    1.48,
     "🇪🇸 LA LIGA":    1.38,
@@ -115,8 +116,6 @@ XG_STD_BY_LEAGUE = {
     "🇵🇹 PRIMEIRA":   1.38,
 }
 
-# Pace por liga (shots/partido relativo a media = 24)
-# Se aplica como multiplicador sobre xG base del equipo
 PACE_BY_LEAGUE = {
     "🇬🇧 PREMIER":    1.10,
     "🇪🇸 LA LIGA":    0.99,
@@ -136,13 +135,11 @@ MAX_EV_THRESHOLD        = 0.15
 MAX_PICKS_PER_FIXTURE   = 1
 XG_DECAY_FACTOR         = 0.85
 XG_CACHE_TTL_HOURS      = 20
-MAX_FIXTURES_PER_SCAN   = 40   # techo por scan — 9 ligas × ~4-5 partidos/día
-MAX_DAYS_BACK_XG        = 90   # máximo días hacia atrás buscando partidos del equipo
+MAX_FIXTURES_PER_SCAN   = 40
+MAX_DAYS_BACK_XG        = 90
 
 VOLATILITY_BUCKETS = {"OVER": 0.85, "UNDER": 0.85, "BTTS": 0.90, "1X2": 1.25}
 
-# Cache de fixtures por fecha — compartida durante el scan y el warmup
-# 1 req por fecha sirve para todos los equipos de todas las ligas
 _DATE_FIXTURES_CACHE: dict = {}
 
 
@@ -191,8 +188,6 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT, count INTEGER
     )""")
-
-    # Cache de xG por equipo (portado de V6.5)
     c.execute("""CREATE TABLE IF NOT EXISTS team_xg_cache (
         team_id INTEGER PRIMARY KEY,
         team_name TEXT,
@@ -209,7 +204,6 @@ def init_db():
     except:
         pass
 
-    # Snapshots intermedios de cuota (portado de V6.5)
     c.execute("""CREATE TABLE IF NOT EXISTS line_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         fixture_id INTEGER,
@@ -218,16 +212,12 @@ def init_db():
         odd_snapshot REAL, odd_open REAL,
         captured_at DATETIME
     )""")
-
-    # Log de resultados FT ingestados (portado de V6.5 — evita duplicados en cache)
     c.execute("""CREATE TABLE IF NOT EXISTS xg_result_log (
         fixture_id INTEGER,
         team_id    INTEGER,
         ingested_at TEXT,
         PRIMARY KEY (fixture_id, team_id)
     )""")
-
-    # Factores avanzados de liga — conservado de V5.12
     c.execute("""CREATE TABLE IF NOT EXISTS league_advanced_factors (
         league TEXT PRIMARY KEY,
         shots_avg REAL, shots_on_target_avg REAL,
@@ -236,7 +226,6 @@ def init_db():
         window_days INTEGER, last_updated DATETIME
     )""")
 
-    # Auto-seed de league_advanced_factors si está vacío
     c.execute("SELECT COUNT(*) FROM league_advanced_factors")
     if c.fetchone()[0] == 0:
         baselines = [
@@ -257,7 +246,6 @@ def init_db():
                 (row[0], row[1], row[2], row[3], row[4], row[5], 100, 30, now)
             )
 
-    # Auto-heal CLVs corruptos al arrancar (portado de V5.10)
     c.execute("SELECT id, selection_key FROM picks_log WHERE clv_captured = 1")
     for pid, skey in c.fetchall():
         if skey and skey.split("|")[-1].replace(".", "", 1).isdigit():
@@ -284,7 +272,6 @@ def log_rejection(fixture_id, match, market, odd, ev, reason):
 
 
 def track_requests(n=1):
-    """Registra requests usados hoy. n=0 solo consulta."""
     try:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         conn  = sqlite3.connect(DB_PATH)
@@ -306,10 +293,6 @@ def track_requests(n=1):
 
 
 def sync_request_counter(headers):
-    """
-    Sincroniza el contador interno con la API real.
-    Portado de V6.5 — evita desfases entre deploys.
-    """
     try:
         r    = requests.get("https://v3.football.api-sports.io/status",
                             headers=headers, timeout=10)
@@ -334,7 +317,7 @@ def sync_request_counter(headers):
 
 
 # ==========================================
-# URS ENGINE (conservado de V5.12, con LIQUIDITY_TIERS por liga)
+# URS ENGINE
 # ==========================================
 
 def get_avg_clv_by_market(market, lookback=30):
@@ -406,7 +389,6 @@ def score_odd(odd):
 
 
 def calculate_urs(ev, odd, league_name):
-    """URS con LIQUIDITY_TIERS por liga — conservado de V5.12."""
     sharpe = get_clv_sharpe()
     liq    = LIQUIDITY_TIERS.get(league_name, 0.70)
     w      = {"sharpe": 0.35, "ev": 0.30, "liquidity": 0.20, "odd": 0.15}
@@ -432,14 +414,13 @@ def get_kelly_and_urs(ev, odd, market, league_name):
 
 
 # ==========================================
-# PORTFOLIO ENGINE (conservado de V5.12, LCP por liga)
+# PORTFOLIO ENGINE
 # ==========================================
 
 def apply_portfolio_risk_engine(preliminary_picks):
     if not preliminary_picks:
         return [], {}
 
-    # LCP europeo: divide por nº de picks de la misma liga (diversificación real)
     league_counts = {}
     for p in preliminary_picks:
         league_counts[p["l_name"]] = league_counts.get(p["l_name"], 0) + 1
@@ -500,10 +481,6 @@ def _weighted_avg(values, decay=XG_DECAY_FACTOR):
 
 
 def _form_factor(gf_series):
-    """
-    Factor de forma reciente: últimos 3 vs los 3 anteriores.
-    Multiplicador entre 0.85 y 1.15. Neutro si menos de 6 partidos.
-    """
     if len(gf_series) < 6:
         return 1.0
     recent   = _weighted_avg(gf_series[:3])
@@ -527,10 +504,6 @@ def negbin_pmf(mu, var, k):
 
 
 def calc_over_under(xg_total, line=2.5, league_name=None):
-    """
-    Over/Under con negbinom calibrado por liga.
-    Usa XG_STD_BY_LEAGUE si está disponible, fallback a league_advanced_factors.
-    """
     std     = XG_STD_BY_LEAGUE.get(league_name, 1.45) if league_name else 1.45
     var     = max(std ** 2, xg_total)
     p_under = sum(negbin_pmf(xg_total, var, k) for k in range(int(np.floor(line)) + 1))
@@ -567,11 +540,10 @@ def calc_btts(xg_home, xg_away):
 
 
 # ==========================================
-# XG ENGINE (portado de V6.5, adaptado para ligas europeas)
+# XG ENGINE
 # ==========================================
 
 def _get_fixtures_for_date(d, headers):
-    """Obtiene fixtures de una fecha usando cache en memoria. 1 req por fecha."""
     if d not in _DATE_FIXTURES_CACHE:
         try:
             r = requests.get(
@@ -591,16 +563,22 @@ def clear_date_cache():
     _DATE_FIXTURES_CACHE.clear()
 
 
-def fetch_team_xg(team_id, headers, league_id=None, use_cache=True, depth=6):
+def clear_past_dates_only():
     """
-    Portado de V6.5: obtiene xG buscando partidos del equipo por fecha.
-    /fixtures?date=YYYY-MM-DD es el único endpoint que no está bloqueado
-    en el plan Free. La cache _DATE_FIXTURES_CACHE evita requests duplicados
-    cuando el mismo día tiene partidos de varios equipos.
+    FIX v5.13: solo borra fechas pasadas del cache.
+    Preserva D+0/D+1/D+2 pre-cargadas por _startup_diagnostics,
+    ahorrando 2-3 req por scan en Free tier.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    past  = [d for d in list(_DATE_FIXTURES_CACHE.keys()) if d < today]
+    for d in past:
+        _DATE_FIXTURES_CACHE.pop(d, None)
+    if past:
+        print(f"  🧹 Cache: {len(past)} fechas pasadas eliminadas, "
+              f"{len(_DATE_FIXTURES_CACHE)} futuras preservadas")
 
-    league_id=None → acepta partidos de cualquier liga (para ligas europeas
-    donde un equipo puede jugar tanto liga como Copa o Champions).
-    """
+
+def fetch_team_xg(team_id, headers, league_id=None, use_cache=True, depth=6):
     if use_cache:
         try:
             conn_c = sqlite3.connect(DB_PATH)
@@ -657,8 +635,7 @@ def fetch_team_xg(team_id, headers, league_id=None, use_cache=True, depth=6):
         gf_series.extend(gf_day)
         ga_series.extend(ga_day)
 
-    # Fallback: si no hay suficientes en la liga principal, aceptar cualquier liga
-    # (Champions, Copa) para tener forma del equipo
+    # Fallback: aceptar cualquier liga (Champions, Copa) para tener forma del equipo
     if len(gf_series) < 2:
         gf_any, ga_any = [], []
         for days_back in range(1, MAX_DAYS_BACK_XG + 1):
@@ -701,14 +678,6 @@ def fetch_team_xg(team_id, headers, league_id=None, use_cache=True, depth=6):
 
 
 def build_xg_match(home_id, away_id, h_inj, a_inj, league_id, league_name, headers, depth=6):
-    """
-    Construye xG del partido usando últimos N partidos de cada equipo.
-    Aplica:
-      - Promedio ataque/defensa cruzado (xG_home = avg(gf_home, ga_away))
-      - Factor de forma reciente (últimos 3 vs anteriores 3)
-      - Factor de lesiones
-      - Pace de liga (multiplicador de ritmo de juego)
-    """
     h_xgf, h_xga, h_conf, h_gf, h_ga, h_cached = fetch_team_xg(
         home_id, headers, league_id=league_id, depth=depth
     )
@@ -719,19 +688,15 @@ def build_xg_match(home_id, away_id, h_inj, a_inj, league_id, league_name, heade
         away_id, headers, league_id=league_id, depth=depth
     )
 
-    # xG base cruzado
     xh = (h_xgf + a_xga) / 2
     xa = (a_xgf + h_xga) / 2
 
-    # Factor de forma (portado de V6.5)
     xh *= _form_factor(h_gf)
     xa *= _form_factor(a_gf)
 
-    # Factor de lesiones
     xh *= (1 - min(h_inj * 0.015, 0.08))
     xa *= (1 - min(a_inj * 0.015, 0.08))
 
-    # Pace de liga (conservado de V5.12, ahora como constante por liga)
     pace = PACE_BY_LEAGUE.get(league_name, 1.0)
     xh *= pace
     xa *= pace
@@ -747,10 +712,6 @@ def build_xg_match(home_id, away_id, h_inj, a_inj, league_id, league_name, heade
 
 
 def ingest_results_into_xg_cache(headers):
-    """
-    Portado de V6.5: ingesta resultados FT reales en team_xg_cache.
-    Usa fechas ya en _DATE_FIXTURES_CACHE (0 req extra en la mayoría de casos).
-    """
     ingested = 0
     dates_to_check = []
 
@@ -841,10 +802,6 @@ def ingest_results_into_xg_cache(headers):
 # ==========================================
 
 def validate_xg(xh, xa, bets):
-    """
-    Detecta xG default o incoherente respecto al mercado.
-    Conservado de V5.12, portado al nuevo pipeline de xG.
-    """
     home_odd = away_odd = over_odd = under_odd = None
     for b in bets:
         if b["id"] == 1:
@@ -964,25 +921,15 @@ class QuantFundEuropean:
     def __init__(self):
         init_db()
         self.headers = {"x-apisports-key": API_SPORTS_KEY}
-
-        # Sincronizar contador con API real antes de cualquier lógica (portado V6.5)
         sync_request_counter(self.headers)
-
         api_ok, plan_info, req_info, access_ok, access_detail = self._startup_diagnostics()
         mode = "🔴 LIVE" if LIVE_TRADING else "🟡 DRY-RUN"
-
         self.send_msg(
             f"🌍 <b>EUROPEAN QUANT FUND V5.13</b>\n"
             f"Estado: {mode}\n\n"
             f"{'✅' if api_ok else '❌'} API: {plan_info}\n"
             f"📡 Requests hoy: {req_info}\n"
-            f"{'✅' if access_ok else '❌'} Ligas: {access_detail}\n"
-            f"\n"
-            f"Mejoras V5.13:\n"
-            f"• xG por fecha real (sin /predictions)\n"
-            f"• Cache compartida entre ligas\n"
-            f"• CLV intermedio + ingest FT\n"
-            f"• sync_request_counter al arrancar"
+            f"{'✅' if access_ok else '❌'} Ligas: {access_detail}"
         )
 
     def _startup_diagnostics(self):
@@ -1008,9 +955,6 @@ class QuantFundEuropean:
         except Exception as e:
             return False, "error de conexión", "?/?", False, str(e)
 
-        # Verificar acceso a ligas por fecha
-        # FIX v5.13: poblar _DATE_FIXTURES_CACHE aquí — run_daily_scan reutiliza
-        # estas respuestas sin hacer nuevos requests para las mismas fechas
         try:
             league_found = set()
             for d_off in range(5):
@@ -1019,7 +963,8 @@ class QuantFundEuropean:
                                  headers=self.headers, params={"date": d}, timeout=10)
                 track_requests(1)
                 fixtures = r.json().get("response", [])
-                _DATE_FIXTURES_CACHE[d] = fixtures   # FIX: cache compartida con scan
+                # FIX v5.13: poblar cache — run_daily_scan reutiliza sin req extra
+                _DATE_FIXTURES_CACHE[d] = fixtures
                 for fix in fixtures:
                     lid = fix["league"]["id"]
                     if lid in TARGET_LEAGUES:
@@ -1029,7 +974,8 @@ class QuantFundEuropean:
                 time.sleep(0.5)
 
             names_found = [TARGET_LEAGUES[lid].split()[-1] for lid in league_found]
-            detail = f"{len(league_found)}/9 ligas con fixtures próximos ({', '.join(names_found[:4])}{'...' if len(names_found)>4 else ''})"
+            detail = (f"{len(league_found)}/9 ligas con fixtures próximos "
+                      f"({', '.join(names_found[:4])}{'...' if len(names_found)>4 else ''})")
             return True, plan_info, req_info, len(league_found) > 0, detail
         except Exception as e:
             return True, plan_info, req_info, False, str(e)
@@ -1050,7 +996,6 @@ class QuantFundEuropean:
             print(f"⚠️  Telegram error: {e}")
 
     def _fetch_and_store_odds(self, c, fid, mkt, skey, now, mark_captured=True):
-        """Obtiene cuota actual y la guarda. mark_captured=False → snapshot intermedio."""
         res = requests.get(
             f"https://v3.football.api-sports.io/odds?fixture={fid}&bookmaker=8",
             headers=self.headers, timeout=10
@@ -1092,11 +1037,6 @@ class QuantFundEuropean:
         return found
 
     def capture_midday_lines(self):
-        """
-        Portado de V6.5: snapshot intermedio entre 2h y 6h antes del KO.
-        No marca el pick como capturado — el cierre real lo sobreescribe.
-        Útil para observar movimiento D-1 → mediodía → cierre.
-        """
         try:
             conn = sqlite3.connect(DB_PATH)
             c    = conn.cursor()
@@ -1116,7 +1056,6 @@ class QuantFundEuropean:
             pass
 
     def capture_closing_lines(self):
-        """Captura cuota de cierre ≤60 min antes del KO."""
         try:
             conn = sqlite3.connect(DB_PATH)
             c    = conn.cursor()
@@ -1142,15 +1081,6 @@ class QuantFundEuropean:
             pass
 
     def weekly_xg_cache(self):
-        """
-        Portado de V6.5 adaptado para 9 ligas europeas.
-        LUNES 08:00 UTC — pre-caché xG last10 todos los equipos activos.
-
-        BUDGET (máximo 44 req):
-          Fase 1 — Discovery por fecha: máx 14 req (1 por fecha, sirve para TODAS las ligas)
-          Fase 2 — Cache last10: máx 30 equipos × 0 req (ya en _DATE_FIXTURES_CACHE)
-          Total máximo: 44 req
-        """
         clear_date_cache()
         BUDGET_MAX  = 44
         req_inicio  = track_requests(0)
@@ -1243,13 +1173,8 @@ class QuantFundEuropean:
             self.send_msg(f"⚠️ weekly_xg_cache error: {e}")
 
     def update_league_advanced_factors(self):
-        """
-        Conservado de V5.12: actualiza goal_std por liga usando /teams/statistics.
-        Solo se ejecuta en días sin jornada (04:00 UTC) para no competir con el scan.
-        """
         today   = datetime.now(timezone.utc)
         weekday = today.weekday()
-        # Actualizar 2 ligas por día de la semana — distribuye el coste
         schedule_ligas = {
             0: [39, 94], 1: [140, 88], 2: [135],
             3: [78],     4: [61],      5: [2],  6: [3]
@@ -1263,7 +1188,7 @@ class QuantFundEuropean:
             season = today.year if today.month >= 8 else today.year - 1
             try:
                 teams = requests.get(
-                    f"https://v3.football.api-sports.io/teams",
+                    "https://v3.football.api-sports.io/teams",
                     headers=self.headers,
                     params={"league": league_id, "season": season},
                     timeout=15
@@ -1322,33 +1247,23 @@ class QuantFundEuropean:
                 conn.close()
 
     def run_daily_scan(self):
-        """
-        V5.13: scan a las 09:00 UTC del día anterior.
-        xG construido desde historial real por fecha (sin /predictions).
-        """
-        now_utc  = datetime.now(timezone.utc)
-        # FIX v5.13: no limpiar fechas futuras que _startup_diagnostics ya pre-cargó
-        # Solo eliminar fechas pasadas obsoletas — preserva D+0, D+1, D+2 del diagnóstico
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        for d in [d for d in _DATE_FIXTURES_CACHE if d < today_str]:
-            _DATE_FIXTURES_CACHE.pop(d, None)
+        now_utc = datetime.now(timezone.utc)
 
-        # Buscar partidos en los próximos 3 días — filtrar >48h después
+        # FIX v5.13: solo borrar fechas pasadas — preservar D+0/D+1/D+2 del diagnóstico
+        clear_past_dates_only()
+
         matches_raw = []
         for days_ahead in [0, 1, 2]:
             d = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-            try:
-                r = requests.get(
-                    "https://v3.football.api-sports.io/fixtures",
-                    headers=self.headers, params={"date": d}, timeout=10
-                )
+            # Si ya está en cache (del diagnóstico), no gasta req extra
+            already = d in _DATE_FIXTURES_CACHE
+            fixtures_day = _get_fixtures_for_date(d, self.headers)
+            if not already:
                 track_requests(1)
-                matches_raw.extend([
-                    f for f in r.json().get("response", [])
-                    if f["league"]["id"] in TARGET_LEAGUES
-                ])
-            except:
-                pass
+            matches_raw.extend([
+                f for f in fixtures_day
+                if f["league"]["id"] in TARGET_LEAGUES
+            ])
 
         def hours_away(m):
             try:
@@ -1366,22 +1281,21 @@ class QuantFundEuropean:
                 "🔇 <b>European V5.13:</b> Sin partidos en los próximos 48h.\n"
                 f"📡 Requests: {track_requests(0)}/100"
             )
+            ingest_results_into_xg_cache(self.headers)
             return
 
-        # Contar por liga para el resumen
         liga_counts = {}
         for m in matches:
             ln = TARGET_LEAGUES[m["league"]["id"]]
             liga_counts[ln] = liga_counts.get(ln, 0) + 1
 
-        req_est = 3 + len(matches) * 3  # fixtures×3 + odds×1 + injuries×1 + xG≈1
+        req_est = len(matches) * 2  # odds + injuries (xG usa cache en su mayoría)
         self.send_msg(
             f"🔍 <b>European V5.13 — Scan D-1</b>\n"
             + "\n".join(f"  {ln}: {n}" for ln, n in sorted(liga_counts.items()))
             + f"\n📡 Requests estimados: ~{req_est}/100"
         )
 
-        # Anti-duplicado entre sesiones
         already_picked_today = set()
         try:
             conn_check = sqlite3.connect(DB_PATH)
@@ -1398,27 +1312,23 @@ class QuantFundEuropean:
         preliminary_picks = []
 
         for m in matches:
-            fid      = m["fixture"]["id"]
-            h_n      = m["teams"]["home"]["name"]
-            a_n      = m["teams"]["away"]["name"]
-            h_id     = m["teams"]["home"]["id"]
-            a_id     = m["teams"]["away"]["id"]
-            ko       = m["fixture"]["date"]
-            lid      = m["league"]["id"]
-            l_name   = TARGET_LEAGUES[lid]
-            label    = f"{h_n} vs {a_n} ({l_name})"
+            fid    = m["fixture"]["id"]
+            h_n    = m["teams"]["home"]["name"]
+            a_n    = m["teams"]["away"]["name"]
+            h_id   = m["teams"]["home"]["id"]
+            a_id   = m["teams"]["away"]["id"]
+            ko     = m["fixture"]["date"]
+            lid    = m["league"]["id"]
+            l_name = TARGET_LEAGUES[lid]
+            label  = f"{h_n} vs {a_n} ({l_name})"
             print(f"\n  ── {label} (fid={fid}) ──")
 
             if fid in already_picked_today:
                 print(f"     ⏭️  Ya procesado hoy — skip")
                 continue
-            if lid not in TARGET_LEAGUES:
-                log_rejection(fid, label, "ALL", 0.0, 0.0, f"LEAGUE_MISMATCH (lid={lid})")
-                continue
 
-            time.sleep(3.0)   # FIX v5.13: 6.1→3.0s — api-football permite 30 req/min en Free
+            time.sleep(3.0)
 
-            # Cuotas Bet365
             try:
                 odds_res = requests.get(
                     "https://v3.football.api-sports.io/odds",
@@ -1432,7 +1342,6 @@ class QuantFundEuropean:
                 continue
             bets = odds_res[0]["bookmakers"][0]["bets"]
 
-            # Lesiones
             try:
                 inj_res = requests.get(
                     "https://v3.football.api-sports.io/injuries",
@@ -1446,14 +1355,12 @@ class QuantFundEuropean:
             except:
                 hinj = ainj = 0
 
-            # xG desde historial real por fecha (V5.13 — reemplaza /predictions)
             xh, xa, xt, conf, xg_src = build_xg_match(
                 h_id, a_id, hinj, ainj, lid, l_name, self.headers, depth=6
             )
             print(f"     xG: {h_n}={xh:.2f} {a_n}={xa:.2f} total={xt:.2f} "
                   f"conf={conf} src={xg_src} req={track_requests(0)}/100")
 
-            # Validar xG vs mercado
             ok, reason = validate_xg(xh, xa, bets)
             if not ok:
                 log_rejection(fid, label, "ALL", 0.0, 0.0, reason)
@@ -1502,80 +1409,73 @@ class QuantFundEuropean:
             candidates.sort(key=lambda x: x["ev"] * x["urs"], reverse=True)
             preliminary_picks.append(candidates[0])
 
-        # Portfolio engine (LCP por liga, conservado de V5.12)
         final, meta = apply_portfolio_risk_engine(preliminary_picks)
 
-        if final:
-            conn = sqlite3.connect(DB_PATH)
-            c    = conn.cursor()
-            reports = [
-                f"📊 <b>European V5.13 — Portfolio:</b>\n"
-                f"Picks: {len(final)} | Vol: {meta['port_vol']*100:.2f}%\n"
-                f"Heat: {meta['final_heat']*100:.2f}% | Damper: {meta['damper']:.2f}x\n"
-                f"📡 Requests: {track_requests(0)}/100"
-            ]
-            for p in final:
-                op_stake = p["final_stake"] if LIVE_TRADING else 0.0
-                c.execute("""INSERT INTO picks_log
-                    (fixture_id, league, home_team, away_team, market, selection,
-                     selection_key, odd_open, prob_model, ev_open, stake_pct,
-                     xg_home, xg_away, xg_total, pick_time, kickoff_time,
-                     urs, model_gap, xg_source)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (p["fid"], p["l_name"], p["h_n"], p["a_n"], p["mkt"], p["pick"],
-                     f"{p['bid']}|{p['val']}", p["odd"], p["prob"], p["ev"], op_stake,
-                     p["xh"], p["xa"], p["xt"],
-                     datetime.now(timezone.utc).isoformat(), p["ko"],
-                     p["urs"], p["model_gap"], p["xg_src"])
+        try:
+            if final:
+                conn = sqlite3.connect(DB_PATH)
+                c    = conn.cursor()
+                reports = [
+                    f"📊 <b>European V5.13 — Portfolio:</b>\n"
+                    f"Picks: {len(final)} | Vol: {meta['port_vol']*100:.2f}%\n"
+                    f"Heat: {meta['final_heat']*100:.2f}% | Damper: {meta['damper']:.2f}x\n"
+                    f"📡 Requests: {track_requests(0)}/100"
+                ]
+                for p in final:
+                    op_stake = p["final_stake"] if LIVE_TRADING else 0.0
+                    c.execute("""INSERT INTO picks_log
+                        (fixture_id, league, home_team, away_team, market, selection,
+                         selection_key, odd_open, prob_model, ev_open, stake_pct,
+                         xg_home, xg_away, xg_total, pick_time, kickoff_time,
+                         urs, model_gap, xg_source)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (p["fid"], p["l_name"], p["h_n"], p["a_n"], p["mkt"], p["pick"],
+                         f"{p['bid']}|{p['val']}", p["odd"], p["prob"], p["ev"], op_stake,
+                         p["xh"], p["xa"], p["xt"],
+                         datetime.now(timezone.utc).isoformat(), p["ko"],
+                         p["urs"], p["model_gap"], p["xg_src"])
+                    )
+                    conf_icon  = "✅" if p["conf"] == "HIGH" else "⚠️ MED"
+                    gap_str    = f"+{p['model_gap']*100:.1f}%" if p["model_gap"] >= 0 else f"{p['model_gap']*100:.1f}%"
+                    reports.append(
+                        f"⚽ {p['h_n']} vs {p['a_n']} | {p['l_name']}\n"
+                        f"🟡 [DRY-RUN] [{p['mkt']}]: {p['pick']}\n"
+                        f"📊 Cuota: @{p['odd']} | EV: +{p['ev']*100:.1f}%\n"
+                        f"📉 URS: {p['urs']:.2f} | LCP: {p['lcp_applied']:.2f}\n"
+                        f"🔬 Gap: {gap_str} | xG: {p['xh']:.1f}-{p['xa']:.1f} {conf_icon}\n"
+                        f"📈 Fuente: {p['xg_src']}\n"
+                        f"🎯 Stake: {p['final_stake']*100:.2f}%"
+                    )
+                conn.commit()
+                conn.close()
+                self.send_msg("\n\n".join(reports))
+            else:
+                self.send_msg(
+                    f"🔇 <b>European V5.13:</b> Sin picks válidos hoy.\n"
+                    f"📡 Requests: {track_requests(0)}/100"
                 )
-                conf_icon  = "✅" if p["conf"] == "HIGH" else "⚠️ MED"
-                gap_str    = f"+{p['model_gap']*100:.1f}%" if p["model_gap"] >= 0 else f"{p['model_gap']*100:.1f}%"
-                disp_stake = p["final_stake"]
-                reports.append(
-                    f"⚽ {p['h_n']} vs {p['a_n']} | {p['l_name']}\n"
-                    f"🟡 [DRY-RUN] [{p['mkt']}]: {p['pick']}\n"
-                    f"📊 Cuota: @{p['odd']} | EV: +{p['ev']*100:.1f}%\n"
-                    f"📉 URS: {p['urs']:.2f} | LCP: {p['lcp_applied']:.2f}\n"
-                    f"🔬 Gap: {gap_str} | xG: {p['xh']:.1f}-{p['xa']:.1f} {conf_icon}\n"
-                    f"📈 Fuente: {p['xg_src']}\n"
-                    f"🎯 Stake: {disp_stake*100:.2f}%"
-                )
-            conn.commit()
-            conn.close()
-
-            # Ingestar resultados FT en cache tras el scan (portado de V6.5)
-            # Usa fechas ya en _DATE_FIXTURES_CACHE — 0 req extra en la mayoría de casos
-            ingest_results_into_xg_cache(self.headers)
-
-            self.send_msg("\n\n".join(reports))
-        else:
-            self.send_msg(
-                f"🔇 <b>European V5.13:</b> Sin picks válidos hoy.\n"
-                f"📡 Requests: {track_requests(0)}/100"
-            )
+        except Exception as e:
+            print(f"run_daily_scan error: {e}")
+            import traceback; traceback.print_exc()
+        finally:
             ingest_results_into_xg_cache(self.headers)
 
 
 if __name__ == "__main__":
     bot = QuantFundEuropean()
 
-    # ── TAREAS DIARIAS ───────────────────────────────────────────────────────
     schedule.every().day.at(RUN_TIME_SCAN).do(bot.run_daily_scan)
     schedule.every().day.at(RUN_TIME_MIDDAY_CLV).do(bot.capture_midday_lines)
     schedule.every(30).minutes.do(bot.capture_closing_lines)
-
-    # ── TAREAS SEMANALES ─────────────────────────────────────────────────────
     schedule.every().monday.at(RUN_TIME_XG_CACHE).do(bot.weekly_xg_cache)
     schedule.every().day.at(RUN_TIME_INGEST).do(bot.update_league_advanced_factors)
 
-    # ── BURN-IN ──────────────────────────────────────────────────────────────
     try:
         from burn_in_evaluator import print_burn_in_report
         print_burn_in_report(DB_PATH)
     except Exception as e:
         print(f"Burn-in no disponible: {e}")
 
-    # ── MORGUE ───────────────────────────────────────────────────────────────
     try:
         print("\n🕵️  MORGUE:")
         conn = sqlite3.connect(DB_PATH)
@@ -1588,7 +1488,6 @@ if __name__ == "__main__":
     except:
         pass
 
-    # ── CLV AUDITOR ──────────────────────────────────────────────────────────
     try:
         print("\n⏳ CLV:")
         conn = sqlite3.connect(DB_PATH)
@@ -1618,7 +1517,6 @@ if __name__ == "__main__":
     except:
         pass
 
-    # ── AUTO-WARMUP ───────────────────────────────────────────────────────────
     cache_count = 0
     try:
         conn_check  = sqlite3.connect(DB_PATH)
